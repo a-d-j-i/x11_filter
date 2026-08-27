@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# proxy output
+*-profile.txt
+filter-report.txt
+
+# local-only e2e targets (heavy apps you test locally but do not ship)
+e2e.local
+
+.idea
