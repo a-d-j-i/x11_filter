@@ -143,8 +143,11 @@ boundary now, so trusted forwarding into it is the correct configuration.
 | **Become** the owner of one of those selections | gated the same way — taking the clipboard clobbers your real copy and answers every later paste |
 | Paste *out* into a desktop application | follows the same gate: it *is* taking ownership, so `--gate deny` refuses it and `--gate ask` prompts for it |
 | Screen capture — `GetImage`, **or a RENDER `CreatePicture` of a foreign drawable** | refused |
+| Covering the screen with borderless windows — one of them, several that add up to it, or one on your second monitor | gated by `--gate`, so a fake desktop or login prompt cannot be painted over yours |
 | Keystroke logging — **XInput** raw/key/button/motion selection or device grab on a foreign window | refused |
 | Keystroke logging — **`QueryKeymap`** polling (the global key-down bitmap) | answered as "no keys down" |
+| Keystroke logging — **grabbing the keyboard**, even on the application's own window, by the core request or through XInput2 | the grab is allowed, because menus need it, but a key event reaches the application only while one of its own windows holds the focus — so a grab captures nothing you type elsewhere |
+| Pointer tracking — **grabbing the pointer**, which reports every motion in the session | allowed (drag-and-drop needs it), but the position in those events is blanked wherever the pointer is not over the application's own window |
 | Pointer tracking — **`QueryPointer`** / **`XIQueryPointer`** anywhere but over one of the application's own mapped windows | position blanked, input-state mask always blanked. `QueryPointer(root)` — the usual way to ask where the mouse is — answers (0,0) |
 | XTEST, RECORD, MIT-SHM, Composite, DAMAGE, GLX, … | hidden and refused by opcode |
 | Core grabs and input-event masks on foreign windows | refused |
@@ -239,6 +242,25 @@ and the exit report marks a name that shows up in each:
 new operation: RENDER:Composite                    allowed  code (pid 4242) [local pid 1990, uid 1000]
 new operation: SomeExt:7                            blocked  code (pid 4242) [local pid 1990, uid 1000]
 ```
+
+Withheld **events** are named the same way, as `event:PropertyNotify` and the
+like. They are worth calling out separately because they are the failure a
+person actually meets: a refused request comes back to the application as an X
+error, but there is no reply behind an event, so withholding one makes an
+application quietly wait rather than fail. That is the difference between a
+paste that reports a problem and a paste that simply never finishes, and until
+the twenty-sixth pass those drops were the one thing the log did not record.
+
+```
+new operation: event:PropertyNotify                 blocked  code (pid 4242) [local pid 1990, uid 1000]
+```
+
+`--dry-run` reports these too. It withholds nothing — the client's stream is
+byte-for-byte an unfiltered one — but it still works out which events enforcing
+would take away and names them, so the ratchet below covers events as well as
+requests. That is worth more than it sounds: an enforcing run tends to report
+*fewer* refusals, because the first withheld event stops the application before
+it reaches the next thing the policy would have refused.
 
 The name is the application's own claim about itself and can say anything; the
 `[local pid …, uid …]` is what the kernel reports for the connecting process and
@@ -337,6 +359,26 @@ sequence numbers, so swallowing one desynchronises every later reply.
   genuinely confined to the tunnel and has neither a local socket nor a cookie
   for `:0`. Anything connecting to `:0` directly is untouched, including any
   other `ssh -X` session you have open.
+- **Everything behind one proxy is one trust domain.** A forwarded application
+  can read and capture *another forwarded application's* windows: through the
+  same proxy, `GetImage` on a sibling's window hands back its pixels, its title
+  reads back, and a property written into it lands — while the same requests
+  from the same client against one of your **local** applications return nothing
+  and do not land (measured, twenty-ninth pass). This is deliberate, not an
+  oversight: the proxy cannot tell which connections belong to which program. An
+  application may open nine, so treating each connection as its own domain would
+  make an application a stranger to its own windows; and over a single `ssh -X`
+  tunnel every forwarded program shares the tunnel's pid, so process credentials
+  cannot separate them either. It matters because the obvious way to run the
+  tool puts several programs inside the boundary — `--ssh remotehost` filters
+  *everything* launched from that shell, so your editor and a tool you only
+  half-trust can reach each other. **If two forwarded programs should not be
+  able to read each other, give them one proxy each**, which is what the
+  single-application form already does:
+
+  ```bash
+  xfilter.py --gate ask --ssh remotehost -- firefox
+  ```
 - Completeness is the rule table, not the server. A request type nobody
   considered is now **blocked and logged** by default rather than passed — which
   is what the default-deny allowlist and the operation log are for. The argument
@@ -429,6 +471,24 @@ sequence numbers, so swallowing one desynchronises every later reply.
   The first time the gate refuses under `deny`, the log says so and names the
   setting — a blocked clipboard otherwise reads as a defect rather than a
   choice.
+- **If the proxy loses sight of the focus, a client holding a keyboard grab
+  goes deaf rather than getting everything.** A grab is allowed — menus need one
+  — and what keeps it from being a keylogger is that keystrokes reach the client
+  only while one of its own windows has the focus. That question is asked on the
+  proxy's own connection to the server; if that connection dies, the answer is
+  "I don't know", and the safe reading of "I don't know" for a client holding
+  the keyboard is to withhold. A client *without* a grab keeps its keys, because
+  X was only ever sending it its own. The log says when this happens, so a menu
+  that stops taking arrow keys has a findable cause.
+- **A permitted paste can be any size, but its far end must keep taking it.**
+  A payload bigger than one request crosses by the INCR protocol, chunk by chunk
+  into the receiving application's window, and the permission the gate granted
+  is what lets each chunk through. That permission is refreshed every time the
+  receiver takes another chunk, so a large or slow paste runs as long as it
+  needs to — 19 MB at five seconds a chunk is measured. What it will not survive
+  is the receiver going quiet for over a minute mid-transfer: the grant lapses,
+  and because X gives an event no way to fail, the paste hangs rather than
+  errors. The log names the withheld event when it happens.
 - **The prompt's grant is per connection, not per application.** Keying a
   remembered *Allow for a while* on the connection is what stops a second
   application inheriting a grant by claiming a name already allowed. The cost
@@ -446,9 +506,64 @@ sequence numbers, so swallowing one desynchronises every later reply.
 ```bash
 python3 test_unit.py        # unit: policy + wire parsing, no X server needed
 ./e2e.sh                    # end-to-end: real clients through the enforcing proxy
+./attack.sh                 # adversarial: the attacks, direct and through the proxy
+./attack.sh --dry-run       # the suite's own self-test: the checks must go red
+RIG_SERVER=xephyr RIG_WM=both ./attack.sh   # ...and against other rigs
+RIG_PARENT="$DISPLAY" RIG_SERVER=xephyr ./attack.sh   # ...watching it happen
 ```
 
-The **unit** tests (114) build request bytes by hand and ask `judge()` what it
+`e2e.sh` also checks two things beyond rendering: for the clients named in
+`RIG_MENU_APPS` it opens a context menu, and then presses a key in it. Opening
+one takes a grab and navigating one takes the keys that grab delivers, which
+makes them the interactions a policy change is most likely to break — a change
+that stopped GTK menus opening once went unnoticed here, because watching a
+window appear and stay up is not the same as watching it work. The keyboard half
+measures the screen's own noise floor first and dumps the menu window rather
+than the root, since a compositing window manager stops the root changing at
+all.
+
+The **attack** suite is the other half of `e2e.sh`: where that one asks whether
+the policy breaks real clients, this asks whether the attacks it claims to stop
+still fail. Each of its checks runs the same attack twice — straight at
+the server, where it **must** succeed, and through the proxy, where it must not.
+A check whose direct run fails is reported `INCONCLUSIVE` rather than passed,
+because an attack that has quietly stopped working proves nothing about the
+policy. Run it with `--dry-run` and the policy enforces nothing, so nearly every
+check must go red: a suite that cannot fail is decoration.
+
+How near "nearly" is depends on the rig, and the self-test says which rather
+than leaving you a number to interpret: it prints the count that went red and
+then **names** every check that did not, because a check that cannot go red with
+the policy switched off is not evidence about the policy. One check stays green
+by design (sanitising the proxy's own log output is not a policy decision, so it
+holds in either mode). Two more are rig-dependent — `CopyArea` cannot be mounted
+under a compositing window manager, and the pointer-grab trace cannot be mounted
+under Xephyr — so the expected tally is 28 of 29 on `xvfb + openbox`, and 27, 27
+and 26 on the other three.
+
+Both harnesses read the **same** rig variables, so one environment drives either
+and the command is the only thing that changes:
+
+| variable | values |
+| --- | --- |
+| `RIG_SERVER` | `xvfb` (default), `xephyr`, `both` |
+| `RIG_WM` | `openbox` (default), `metacity`, `none`, `both` |
+| `RIG_COMPOSITE` | `0` to run metacity without its compositor |
+| `RIG_PARENT` | a display to nest Xephyr in — `"$DISPLAY"` to watch it |
+| `RIG_DWELL` | `e2e.sh` only: seconds to watch each client (5) |
+| `RIG_MENU_APPS` | `e2e.sh` only: clients whose context menu must open *and* answer the keyboard (`gedit`) |
+| `RIG_MENU_KEY` | `e2e.sh` only: the key that menu must respond to (`Down`) |
+
+Which server you pick decides what can be tested at all: Xvfb offers a thin
+extension set, while Xephyr is Xorg-derived and hands a client the Composite,
+DAMAGE, MIT-SHM, RECORD and XTEST surface a real desktop does — and an attack is
+only proven closed on a server that offers the route it would take. Xephyr draws
+into a window, so without `RIG_PARENT` it is nested in a headless Xvfb and the
+run stays unattended; the parent is only a canvas, and the nested server still
+offers its clients the full extension set either way. (`e2e.sh` also still
+accepts its older `E2E_*` names.)
+
+The **unit** tests (129) build request bytes by hand and ask `judge()` what it
 thinks — no X server, no network, no GUI — which is where a wrong answer is a
 security hole rather than a crash. They cover the parts that must not drift: the
 BIG-REQUESTS framing that keeps a request from being smuggled past the policy,
@@ -504,6 +619,8 @@ MIT. See `LICENSE`.
 - `xfilter.py` — the command: policy, gate, spawning, reporting.
 - `test_unit.py` — the policy and parsing tests.
 - `e2e.sh` — end-to-end test: real X clients through the enforcing proxy.
+- `attack.sh`, `attack.py` — adversarial test: the attacks the policy claims to
+  stop, each run straight at the server and through the proxy.
 - `xfilter_core.py` — the relay: connection setup and cookie swap, request and
   reply parsing, atom and extension bookkeeping, the profile. Also runs
   standalone as a pure profiler (`python3 xfilter_core.py --display :20 …`),

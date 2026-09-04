@@ -11,20 +11,31 @@
 # server for depends on both.  Each defaults to the cheap setting; `both` runs
 # the same clients once per value and reports a line per combination.
 #
-#   E2E_SERVER=xvfb    (default)  headless frame buffer
-#   E2E_SERVER=xephyr             a genuine Xorg-derived server: the visuals,
+#   RIG_SERVER=xvfb    (default)  headless frame buffer
+#   RIG_SERVER=xephyr             a genuine Xorg-derived server: the visuals,
 #                                 RENDER and Composite a desktop client meets
-#   E2E_SERVER=both               run under each in turn
+#   RIG_SERVER=both               run under each in turn
 #
-#   E2E_WM=openbox     (default)  reparenting, no compositor
-#   E2E_WM=metacity               reparenting *and* compositing, which is what
+#   RIG_WM=openbox     (default)  reparenting, no compositor
+#   RIG_WM=metacity               reparenting *and* compositing, which is what
 #                                 a desktop session actually looks like
-#   E2E_WM=none                   bare server, no frames at all
-#   E2E_WM=both                   run under openbox and metacity in turn
+#   RIG_WM=none                   bare server, no frames at all
+#   RIG_WM=both                   run under openbox and metacity in turn
 #
-#   E2E_DWELL=15                  watch each client this long after it maps (5)
-#   E2E_COMPOSITE=0               run metacity without its compositor
-#   E2E_PARENT="$DISPLAY"         nest Xephyr in your own display and watch it
+#   RIG_MENU_APPS="gedit code"    clients whose context menu must open *and*
+#                                 answer the keyboard: opening one takes a grab
+#                                 and navigating one takes the keys that grab
+#                                 delivers, so between them they are the
+#                                 interaction a policy change is most likely to
+#                                 break
+#   RIG_MENU_KEY=Down             the key the menu must respond to
+#   RIG_DWELL=15                  watch each client this long after it maps (5)
+#   RIG_COMPOSITE=0               run metacity without its compositor
+#   RIG_PARENT="$DISPLAY"         nest Xephyr in your own display and watch it
+#
+# attack.sh reads the same RIG_* variables, so the same environment can drive
+# either harness and the command is the only thing that changes.  The older
+# E2E_* spellings still work here.
 #
 # The proxy is generic -- it filters whatever speaks the X protocol -- so any
 # X client works here.  Needs xwininfo, xauth, and Xvfb or Xephyr; skips apps
@@ -38,10 +49,16 @@ work="$(mktemp -d)"
 # a way the toolkit only trips over later -- a reply field that resolves to a
 # NULL pointer inside Xlib, say -- so the client maps, then dies.  Without this
 # the run would score that a PASS.
-dwell="${E2E_DWELL:-5}"
-composite="${E2E_COMPOSITE:-1}"
+dwell="${RIG_DWELL:-${E2E_DWELL:-5}}"
+composite="${RIG_COMPOSITE:-${E2E_COMPOSITE:-1}}"
 par=":79"; up=":71"; px=":72"     # Xephyr's parent, upstream, and proxy
-up_auth="$work/up.auth"; px_auth="$work/px.auth"
+# ...and one more proxy, identical but for `--gate allow`.  The clipboard gate
+# defaults to refusing a paste out, which is the right default and also means
+# the default run can say nothing about what a *permitted* paste does.  The
+# INCR path only exists on the permitted side, so it gets a display of its own
+# rather than an environment variable somebody has to remember to set.
+ax=":73"
+up_auth="$work/up.auth"; px_auth="$work/px.auth"; ax_auth="$work/ax.auth"
 
 # Named clients replace the defaults entirely, so `./e2e.sh <app>` tests just
 # that one.  With no arguments the default set runs, plus any extra targets you
@@ -59,40 +76,41 @@ if [ ${#apps[@]} -eq 0 ]; then
 fi
 
 teardown() {                      # everything one combination started
+    [ -n "${allower:-}" ] && kill "$allower" 2>/dev/null
     [ -n "${proxy:-}" ]  && kill "$proxy" 2>/dev/null
     [ -n "${wm:-}" ]     && kill "$wm" 2>/dev/null
     [ -n "${upsrv:-}" ]  && kill "$upsrv" 2>/dev/null
     [ -n "${parent:-}" ] && kill "$parent" 2>/dev/null
-    proxy=""; wm=""; upsrv=""; parent=""
+    proxy=""; wm=""; upsrv=""; parent=""; allower=""
     rm -f "/tmp/.X11-unix/X${up#:}" "/tmp/.X11-unix/X${px#:}" \
-          "/tmp/.X11-unix/X${par#:}"
+          "/tmp/.X11-unix/X${ax#:}" "/tmp/.X11-unix/X${par#:}"
 }
 cleanup() { teardown; rm -rf "$work"; }
 trap cleanup EXIT
-proxy=""; wm=""; upsrv=""; parent=""
+proxy=""; wm=""; upsrv=""; parent=""; allower=""
 
 need() { command -v "$1" >/dev/null || { echo "SKIP: $1 not installed"; exit 0; }; }
 need xwininfo; need xauth
 
 # -- what to run, on which axes ---------------------------------------------
-case "${E2E_SERVER:-xvfb}" in
+case "${RIG_SERVER:-${E2E_SERVER:-xvfb}}" in
     both)   servers=(xvfb xephyr) ;;
     xephyr) servers=(xephyr) ;;
     xvfb)   servers=(xvfb) ;;
-    *)      echo "E2E_SERVER must be xvfb, xephyr or both"; exit 2 ;;
+    *)      echo "RIG_SERVER must be xvfb, xephyr or both"; exit 2 ;;
 esac
-case "${E2E_WM:-openbox}" in
+case "${RIG_WM:-${E2E_WM:-openbox}}" in
     both)     managers=(openbox metacity) ;;
     metacity) managers=(metacity) ;;
     openbox)  managers=(openbox) ;;
     none)     managers=(none) ;;
-    *)        echo "E2E_WM must be openbox, metacity, none or both"; exit 2 ;;
+    *)        echo "RIG_WM must be openbox, metacity, none or both"; exit 2 ;;
 esac
 for s in "${servers[@]}"; do
     [ "$s" = xephyr ] && need Xephyr
-    # Xephyr draws into a window, so without E2E_PARENT it needs an Xvfb to
+    # Xephyr draws into a window, so without RIG_PARENT it needs an Xvfb to
     # sit in -- which keeps the run headless either way.
-    { [ "$s" = xvfb ] || [ -z "${E2E_PARENT:-}" ]; } && need Xvfb
+    { [ "$s" = xvfb ] || [ -z "${RIG_PARENT:-${E2E_PARENT:-}}" ]; } && need Xvfb
 done
 for m in "${managers[@]}"; do
     [ "$m" = none ] || command -v "$m" >/dev/null || {
@@ -106,6 +124,171 @@ cookie() { python3 -c 'import os; print(os.urandom(16).hex())'; }
 win_ids() { DISPLAY="$up" XAUTHORITY="$up_auth" \
             xwininfo -root -children 2>/dev/null \
             | grep -oE '0x[0-9a-f]+' | sort -u; }
+
+# Applications whose context menu must open.  Rendering is not the whole of
+# "does the policy break real clients": a menu is the interaction most likely
+# to break, because opening one takes a grab -- and a policy change that
+# stopped GTK menus opening altogether went unnoticed here until it was
+# measured by hand on a nested desktop.  Now it is measured every run.
+menu_apps="${RIG_MENU_APPS-gedit}"
+
+# Where a person's hands are.  With Xephyr the input goes to the *outer*
+# display, so the nested server turns it into genuine device input; Xephyr's
+# window is at the origin there, so the coordinates need no translation.
+hands() {
+    if [ -n "${input_display:-}" ]; then
+        DISPLAY="$input_display" xdotool "$@"
+    else
+        DISPLAY="$up" XAUTHORITY="$up_auth" xdotool "$@"
+    fi
+}
+
+# The largest of a set of window ids: the client's own window rather than the
+# helper the window manager also created, which sorting by id picks up instead.
+biggest_of() {
+    local id area best best_area=0 line
+    for id in $1; do
+        line="$(DISPLAY="$up" XAUTHORITY="$up_auth" \
+                xwininfo -id "$id" 2>/dev/null | grep -E '^  (Width|Height):')"
+        [ -n "$line" ] || continue
+        area=$(echo "$line" | awk '{print $2}' | paste -sd'*' | bc 2>/dev/null)
+        [ -n "$area" ] || continue
+        if [ "$area" -gt "$best_area" ]; then best_area="$area"; best="$id"; fi
+    done
+    echo "${best:-}"
+}
+
+# A raw dump of the screen.  xwd rather than a compressed screenshot: the bytes
+# are the pixels, so a difference count means what it says.
+# The window's own contents, not the root's: a compositing window manager
+# redirects windows offscreen, so the root stops changing and a dump of it
+# reports a menu that never moves.  Measured under metacity: zero bytes
+# changed, zero noise -- the instrument was blind, not the menu broken.
+snap() { DISPLAY="$up" XAUTHORITY="$up_auth" \
+         xwd -id "$2" -silent > "$1" 2>/dev/null; }
+changed() { cmp -l "$1" "$2" 2>/dev/null | wc -l; }
+
+# Right-click the middle of the client's window, see whether a menu opens, and
+# then whether it answers the keyboard.
+#
+# Both halves matter and only the first is obvious.  Opening a menu takes a
+# grab; *navigating* one takes the keys that grab delivers, and a policy can
+# perfectly well allow the menu to appear while the arrow keys go nowhere --
+# which is exactly the shape of one fix this audit tried and withdrew.
+#
+#   0  the menu opened and took the keyboard
+#   1  no menu opened
+#   2  there was no window to click in
+#   3  a menu opened but ignored the keyboard
+# A big clipboard payload is the one thing a filtered application sends out in
+# *chunks over time* rather than in one request.  Past a request's worth of
+# data ICCCM switches to the INCR protocol: the owner answers with a type of
+# INCR and then writes each chunk into the requestor's window -- foreign --
+# waiting for a PropertyNotify back from it before sending the next.  Both of
+# those are refused by default and allowed only by the selection grant, so this
+# is the interaction where the grant's shape shows.  A small paste exercises
+# none of it, which is the point of the size here.
+#
+# Twenty-sixth pass.  There was no clipboard check in this file at all until
+# now, and that gap is why the grant's sixty seconds went twelve passes without
+# anyone noticing it bounded the whole transfer rather than an idle one: a paste
+# that took longer than that simply stopped half-way, and nothing in this file
+# had ever pasted anything.  The timing itself is pinned by the unit tests, which can do it
+# deterministically; what this adds is the proof that a real toolkit's INCR
+# transfer crosses the proxy intact at all.
+clipboard_out() {
+    command -v xclip >/dev/null || {
+        echo "skip  clipboard paste-out (xclip not installed)"; return 0; }
+    kill -0 "${allower:-0}" 2>/dev/null || {
+        echo "skip  clipboard paste-out (no --gate allow proxy)"; return 0; }
+    local payload="$work/clip.in" got="$work/clip.out" owner="" size="" broke=0
+    python3 -c "
+import sys
+sys.stdout.write(('a clipboard payload %s\\n' % ('x' * 44)) * 70000)
+" > "$payload"
+    size="$(wc -c < "$payload")"
+
+    # permitted: the whole payload has to arrive, chunk by chunk
+    DISPLAY="$ax" XAUTHORITY="$ax_auth" xclip -selection clipboard -i "$payload" \
+        </dev/null >/dev/null 2>&1 & owner=$!
+    sleep 2
+    : > "$got"
+    DISPLAY="$up" XAUTHORITY="$up_auth" timeout 90 xclip -o -selection clipboard \
+        >"$got" 2>/dev/null
+    kill "$owner" 2>/dev/null
+    if cmp -s "$payload" "$got"; then
+        echo "PASS  a $size-byte paste out of a permitted app arrived intact"
+    else
+        echo "FAIL  permitted paste-out: got $(wc -c < "$got" 2>/dev/null || echo 0) of $size bytes"
+        broke=1
+    fi
+
+    # ...and refused, the gate has to stop the same payload rather than let a
+    # big one through by a different road: taking the selection is refused, so
+    # there is nothing upstream to paste.
+    case " ${XFILTER_ARGS:-} " in
+        *"--gate allow"*|*"--gate ask"*) return "$broke" ;;
+    esac
+    DISPLAY="$up" XAUTHORITY="$up_auth" xclip -selection clipboard -i /dev/null \
+        </dev/null >/dev/null 2>&1 &
+    local upstream_owner=$!
+    sleep 1
+    DISPLAY="$px" XAUTHORITY="$px_auth" xclip -selection clipboard -i "$payload" \
+        </dev/null >/dev/null 2>&1 & owner=$!
+    sleep 2
+    : > "$got"
+    DISPLAY="$up" XAUTHORITY="$up_auth" timeout 20 xclip -o -selection clipboard \
+        >"$got" 2>/dev/null
+    kill "$owner" "$upstream_owner" 2>/dev/null
+    if cmp -s "$payload" "$got"; then
+        echo "FAIL  the default gate let a $size-byte paste out anyway"
+        broke=1
+    else
+        echo "PASS  the default gate refused the same paste out"
+    fi
+    return "$broke"
+}
+
+menu_opens() {
+    local geometry x y before after noise signal floor key
+    key="${RIG_MENU_KEY:-Down}"
+    # By window id, not by pid: the client is started under setsid, so the pid
+    # in hand is the group leader's rather than the application's, and
+    # _NET_WM_PID does not match it.  The id is the one this run watched appear.
+    geometry="$(DISPLAY="$up" XAUTHORITY="$up_auth" \
+                xdotool getwindowgeometry --shell "$1" 2>/dev/null)"
+    [ -n "$geometry" ] || return 2               # no window to click in
+    eval "$geometry"
+    x=$((X + WIDTH / 2)); y=$((Y + HEIGHT / 2))
+    before="$(win_ids)"
+    hands mousemove "$x" "$y" >/dev/null 2>&1
+    sleep 0.4
+    hands click 3 >/dev/null 2>&1
+    sleep 1.5
+    after="$(comm -13 <(printf '%s\n' "$before") <(win_ids))"
+    if [ -z "$after" ]; then
+        hands key Escape >/dev/null 2>&1
+        return 1
+    fi
+
+    # The noise floor first: a caret blinks, a clock ticks, so "the screen
+    # changed" on its own proves nothing.  Two shots with nothing pressed say
+    # how much this screen moves by itself; the keypress has to beat that.
+    local menu
+    menu="$(biggest_of "$after")"
+    [ -n "$menu" ] || menu="$1"
+    snap "$work/menu.a" "$menu"; sleep 0.6; snap "$work/menu.b" "$menu"
+    noise="$(changed "$work/menu.a" "$work/menu.b")"
+    hands key "$key" >/dev/null 2>&1
+    sleep 0.6
+    snap "$work/menu.c" "$menu"
+    signal="$(changed "$work/menu.b" "$work/menu.c")"
+    hands key Escape >/dev/null 2>&1
+    floor=$(( noise * 3 + 200 ))
+    echo "      (menu keyboard: $signal bytes changed, noise $noise, needs $floor)" >&2
+    [ "$signal" -gt "$floor" ] || return 3
+    return 0
+}
 
 # -- one combination of server and window manager ---------------------------
 # Returns the number of clients the policy broke, or 255 if the harness itself
@@ -122,7 +305,7 @@ run_combination() {
     xauth -f "$up_auth" add "$up" MIT-MAGIC-COOKIE-1 "$(cookie)"
 
     if [ "$server" = xephyr ]; then
-        local parent_display="${E2E_PARENT:-}"
+        local parent_display="${RIG_PARENT:-${E2E_PARENT:-}}"
         if [ -z "$parent_display" ]; then
             Xvfb "$par" -screen 0 1500x1050x24 >/dev/null 2>&1 & parent=$!
             for _ in $(seq 40); do
@@ -130,11 +313,13 @@ run_combination() {
             done
             parent_display="$par"
         fi
+        input_display="$parent_display"
         DISPLAY="$parent_display" Xephyr "$up" -screen 1280x900x24 \
             -auth "$up_auth" >"$work/server.err" 2>&1 & upsrv=$!
     else
         Xvfb "$up" -screen 0 1280x900x24 -auth "$up_auth" \
             >"$work/server.err" 2>&1 & upsrv=$!
+        input_display=""
     fi
     for _ in $(seq 60); do [ -S "/tmp/.X11-unix/X${up#:}" ] && break; sleep 0.25; done
     [ -S "/tmp/.X11-unix/X${up#:}" ] || {
@@ -175,6 +360,14 @@ run_combination() {
     kill -0 "$proxy" 2>/dev/null || {
         echo "ERROR: proxy did not start"; cat "$work/proxy.err"; return 255; }
 
+    : > "$ax_auth"; chmod 600 "$ax_auth"
+    XAUTHORITY="$up_auth" python3 "$here/xfilter.py" --display "$ax" \
+        --upstream "$up" --auth "$ax_auth" --upstream-auth "$up_auth" \
+        --gate allow --log "$work/allow.log" \
+        >"$work/allow.out" 2>"$work/allow.err" &
+    allower=$!
+    for _ in $(seq 40); do [ -S "/tmp/.X11-unix/X${ax#:}" ] && break; sleep 0.25; done
+
     local broken=0 app bin before home pid ok
     for app in "${apps[@]}"; do
         bin="${app%% *}"
@@ -197,9 +390,10 @@ run_combination() {
             XDG_RUNTIME_DIR="$home/run" \
             DISPLAY="$px" XAUTHORITY="$px_auth" setsid $app >/dev/null 2>&1 &
         pid=$!
-        ok=""
+        ok=""; mapped=""
         for _ in $(seq 360); do      # up to ~90s, for a JVM/Electron cold start
-            [ -n "$(comm -13 <(printf '%s\n' "$before") <(win_ids))" ] && { ok=1; break; }
+            mapped="$(biggest_of "$(comm -13 <(printf '%s\n' "$before") <(win_ids))")"
+            [ -n "$mapped" ] && { ok=1; break; }
             kill -0 "$pid" 2>/dev/null || break
             sleep 0.25
         done
@@ -211,6 +405,18 @@ run_combination() {
             done
             if kill -0 "$pid" 2>/dev/null; then
                 echo "PASS  $app rendered and stayed up under enforce"
+                case " $menu_apps " in
+                    *" $bin "*)
+                        menu_opens "$mapped"; menu_status=$?
+                        case "$menu_status" in
+                            0) echo "PASS  $app opened a context menu and it took the keyboard" ;;
+                            2) echo "note  $app: no window to click in" ;;
+                            3) echo "FAIL  $app opened a menu that ignores the keyboard"
+                               broken=$((broken + 1)) ;;
+                            *) echo "FAIL  $app could not open a context menu"
+                               broken=$((broken + 1)) ;;
+                        esac ;;
+                esac
             else
                 echo "FAIL  $app rendered, then died within ${dwell}s under the policy"
                 broken=$((broken + 1))
@@ -222,6 +428,8 @@ run_combination() {
         kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null   # the whole group
         for _ in $(seq 12); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
     done
+
+    clipboard_out || broken=$((broken + 1))
 
     echo "operations the policy blocked:"
     if grep -qF ' blocked ' "$work/ops.log" 2>/dev/null; then

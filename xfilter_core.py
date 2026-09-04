@@ -273,6 +273,28 @@ class Profile:
         with self.lock:
             self.ranges.append((base, mask))
 
+    def forget_range(self, base, mask):
+        """A proxied connection has ended, so its resource-id range is no
+        longer ours.
+
+        This is not tidiness, it is the boundary.  The X server hands each
+        client a resource-id range out of a fixed table and **reuses a range
+        once its client disconnects**, so a range kept after its owner has
+        gone is a range that will be issued to somebody else -- and while the
+        proxy still lists it, every rule that asks is_foreign() answers "ours"
+        about a *trusted* application's windows: readable, capturable,
+        writable.  Found by the attack suite, which opens and closes enough
+        connections to make the server come round to a base it had used
+        before: a plain, direct client was handed 0xc00000, a base a filtered
+        connection had held earlier in the same run, and `GetImage` on its
+        window came back with 4096 bytes of its pixels.
+        """
+        with self.lock:
+            try:
+                self.ranges.remove((base, mask))
+            except ValueError:
+                pass
+
     def is_foreign(self, xid):
         """True if no connection we proxy could have created this XID.
 
@@ -927,6 +949,12 @@ class Connection(threading.Thread):
         except (OSError, struct.error):
             pass
         finally:
+            # The range goes back before the sockets close, because the moment
+            # the server sees this client leave it may hand the same range to
+            # the next one -- and anything still listing it as ours would be
+            # calling a stranger's windows our own.
+            if self.id_mask:
+                self.profile.forget_range(self.id_base, self.id_mask)
             for sock in (self.client, self.server):
                 if sock is not None:
                     try:

@@ -403,6 +403,260 @@ def test_default_deny_blocks_the_unlisted():
     assert conn.judge(200, 0, b"")[0] == "block"
 
 
+def _value_list(mask, marked_bit, marked_value, other=0):
+    """The value list a client sends for `mask`: one word per set bit, in
+    ascending bit order, with `marked_bit`'s word set to `marked_value`."""
+    values = b""
+    for bit in sorted(1 << n for n in range(32) if mask & (1 << n)):
+        values += struct.pack(LE + "I",
+                              marked_value if bit == marked_bit else other)
+    return values
+
+
+def test_a_value_lists_gated_word_is_found_wherever_the_mask_puts_it():
+    """The gated value must be read from where the *client* put it, for every
+    shape of mask.
+
+    A value list carries one word per set bit, in ascending bit order, so the
+    offset of the word a rule cares about depends on which other bits are set.
+    `_value_offset` computes that by counting bits, and the eighth pass checked
+    it by reading the code.  This checks it by construction: for every subset
+    of the mask bits, the fullscreen gate must fire when override-redirect is
+    the dangerous value and stay quiet when it is not -- so the rule is reading
+    that word and no other, wherever it lands.  A truncated list, which the
+    rule cannot read at all, must refuse rather than skip.
+    """
+    conn = fs_connection()
+    attributes = [1 << n for n in range(15)]          # CWBackPixmap .. CWCursor
+    override = xfilter.CW_OVERRIDE_REDIRECT
+    misread = []
+    for extra in range(1 << len(attributes)):
+        mask = override
+        for index, bit in enumerate(attributes):
+            if extra & (1 << index) and bit != override:
+                mask |= bit
+        if bin(mask).count("1") > 6:                  # a sample, not 32k bodies
+            continue
+
+        # ChangeWindowAttributes on a fullscreen-sized own window
+        conn.profile.note_window(OWN, ROOT, FS_W, FS_H, False)
+        request = struct.pack(LE + "II", OWN, mask)
+        on = request + _value_list(mask, override, 1, other=0xFFFFFFFF)
+        off = request + _value_list(mask, override, 0, other=0xFFFFFFFF)
+        if not isinstance(conn.judge(2, 0, on)[0], tuple):
+            misread.append("mask 0x%x: override-redirect not seen" % mask)
+        if conn.judge(2, 0, off)[0] != "allow":
+            misread.append("mask 0x%x: something else read as override" % mask)
+        # the list cut short of that word: unreadable, so refused
+        cut = request + _value_list(mask, override, 1)[:-4]
+        if conn.judge(2, 0, cut)[0] == "allow":
+            misread.append("mask 0x%x: truncated list allowed" % mask)
+    assert not misread, "the value-list offset is wrong:\n    " \
+        + "\n    ".join(misread[:12])
+
+
+def test_configure_windows_gated_words_are_found_the_same_way():
+    """The same question for ConfigureWindow, whose mask is 16-bit and whose
+    gated words are the size a window is being resized to, and the sibling it
+    is being stacked against."""
+    conn = fs_connection()
+    conn.profile.note_window(OWN, ROOT, SMALL_W, SMALL_H, True)   # override-redirect
+    bits = [1 << n for n in range(7)]                # CWX .. CWStackMode
+    width, height, sibling = xfilter.CONFIGURE_WIDTH, xfilter.CONFIGURE_HEIGHT, \
+        xfilter.CW_SIBLING
+    wrong = []
+    for extra in range(1 << len(bits)):
+        mask = width | height
+        for index, bit in enumerate(bits):
+            if extra & (1 << index):
+                mask |= bit
+        values = b""
+        for bit in sorted(bits):
+            if not mask & bit:
+                continue
+            if bit == width:
+                values += struct.pack(LE + "I", FS_W)
+            elif bit == height:
+                values += struct.pack(LE + "I", FS_H)
+            elif bit == sibling:
+                values += struct.pack(LE + "I", OWN)
+            else:
+                values += struct.pack(LE + "I", 7)
+        request = struct.pack(LE + "IHxx", OWN, mask) + values
+        verdict = conn.judge(12, 0, request)[0]
+        if not (isinstance(verdict, tuple) and verdict[0] == "fullscreen"):
+            wrong.append("mask 0x%x: the resize to fullscreen was missed" % mask)
+        if mask & sibling:
+            foreign = request[:8 + 4 * bin(mask & (sibling - 1)).count("1")] \
+                + struct.pack(LE + "I", FOREIGN) \
+                + request[12 + 4 * bin(mask & (sibling - 1)).count("1"):]
+            if conn.judge(12, 0, foreign)[0] != "silent":
+                wrong.append("mask 0x%x: the foreign sibling was missed" % mask)
+    assert not wrong, "ConfigureWindow reads the wrong word:\n    " \
+        + "\n    ".join(wrong[:12])
+
+
+def test_no_substitution_leaks_a_field_it_meant_to_blank():
+    """A reply shorter than the range a rule blanks must not keep the field.
+
+    The scrubbers clamp their ranges to the reply they were given, which is
+    right -- they must not read past it -- but clamping is only safe if a short
+    reply cannot then carry the very bytes the rule exists to remove.  The
+    question is the reply-side twin of the truncation sweep above, and it is
+    asked of every substitution the policy performs, at every length.
+    """
+    conn = rooted_connection()
+    leaked = []
+
+    def blanked(produce, offsets, length):
+        """produce() a scrubbed reply of `length` bytes; True if every one of
+        `offsets` is either gone or zero."""
+        buffer = bytearray(64)
+        buffer[0] = 1
+        for offset in offsets:
+            struct.pack_into(LE + "I", buffer, offset, FOREIGN)
+        head, body = bytes(buffer[:32]), bytes(buffer[32:length or 32])
+        out = produce(head[:length] if length < 32 else head, body)
+        for offset in offsets:
+            if offset + 4 <= len(out) and \
+                    struct.unpack_from(LE + "I", out, offset)[0] not in (0, 0xFFFFFFFF):
+                return False
+        return True
+
+    for length in range(0, 64, 4):
+        # the modifier/lock state scrubs, the focus and selection-owner
+        # stand-ins, and the pointer bound, each against a reply cut to `length`
+        if not blanked(lambda h, b: conn.scrub_reply(h, b, [(8, 18)]),
+                       [8, 12, 16, 20], length):
+            leaked.append("scrub_reply kept state at %d bytes" % length)
+        if not blanked(lambda h, b: conn.scrub_foreign_windows(h, b, [8], 0),
+                       [8], length):
+            leaked.append("scrub_foreign_windows kept a window at %d bytes"
+                          % length)
+        if not blanked(
+                lambda h, b: conn.scrub_foreign_windows(
+                    h, b, [8], xfilter.SELECTION_OWNER_STANDIN), [8], length):
+            leaked.append("the selection stand-in kept an owner at %d bytes"
+                          % length)
+    assert not leaked, "a substitution left what it meant to remove:\n    " \
+        + "\n    ".join(leaked[:8])
+
+
+def _judge_like_forward(conn, opcode, minor, body):
+    """judge(), with the same guard forward() puts around it: a request the
+    policy cannot parse is blocked rather than passed."""
+    try:
+        return conn.judge(opcode, minor, body)[0]
+    except (struct.error, IndexError, UnicodeDecodeError):
+        return "block"
+
+
+def _gated_requests():
+    """Every (opcode, minor, offsets) the policy gates on a foreign resource,
+    read out of the policy's own tables so this cannot fall behind them."""
+    for opcode, offsets in xfilter.FOREIGN_RESOURCE_REQUESTS.items():
+        yield "core", opcode, 0, offsets
+    for opcode, offsets in xfilter.SCREEN_REFERENCE_REQUESTS.items():
+        yield "core", opcode, 0, offsets
+    for opcode, offsets in xfilter.SCREEN_REFERENCE_REPLIES.items():
+        yield "core", opcode, 0, offsets
+    for opcode, offsets in xfilter.CURSOR_SOURCE_REQUESTS.items():
+        yield "core", opcode, 0, offsets
+    for opcode in xfilter.WINDOW_WRITE_REQUESTS:
+        yield "core", opcode, 0, (0,)
+    for opcode in (3, 14, 15, 21, 73):        # attributes, geometry, tree, image
+        yield "core", opcode, 0, (0,)
+    for minor, offsets in xfilter.XFIXES_FOREIGN.items():
+        yield "XFIXES", 142, minor, offsets
+    for minor, offsets in xfilter.RENDER_FOREIGN.items():
+        yield "RENDER", 139, minor, offsets
+    for minor, offsets in xfilter.SYNC_FOREIGN.items():
+        yield "SYNC", 134, minor, offsets
+    for minor in xfilter.SHAPE_WINDOW_WRITES:
+        yield "SHAPE", 141, minor, (4,)
+    for minor in xfilter.XI_FOREIGN_WINDOW_READS:
+        yield "XInputExtension", 131, minor, (0,)
+
+
+def test_no_gate_falls_open_on_a_body_too_short_to_read():
+    """A rule that cannot read its field must refuse, not shrug.
+
+    This is the shape the audit has found by hand twice -- `if len(body) >=
+    offset + 4` and then a fall-through to allow, in XKB's GetDeviceInfo and in
+    the foreign-window event mask -- so it is worth asking the question of every
+    gated request at once rather than one at a time.  The bodies come from the
+    policy's own tables, so a rule added later is swept too.
+    """
+    conn = rooted_connection()
+    conn.extension_opcodes = {142: "XFIXES", 139: "RENDER", 134: "SYNC",
+                              141: "SHAPE", 131: "XInputExtension"}
+    escaped = []
+    for label, opcode, minor, offsets in _gated_requests():
+        full = max(offsets) + 4
+        body = bytearray(full + 16)
+        for offset in offsets:                # every gated field names a stranger
+            struct.pack_into(LE + "I", body, offset, FOREIGN)
+        if _judge_like_forward(conn, opcode, minor, bytes(body)) == "allow":
+            escaped.append("%s:%s/%s naming a foreign resource"
+                           % (label, opcode, minor))
+            continue
+        for length in range(0, len(body), 4):        # ...and every truncation
+            if _judge_like_forward(conn, opcode, minor,
+                                   bytes(body[:length])) == "allow":
+                escaped.append("%s:%s/%s truncated to %d bytes"
+                               % (label, opcode, minor, length))
+    assert not escaped, "a gate let a foreign request through:\n    " \
+        + "\n    ".join(escaped)
+
+
+def test_a_departed_connections_range_stops_being_ours():
+    # The X server hands each client a resource-id range from a fixed table and
+    # reuses a range once its client disconnects.  The profile kept every range
+    # it had ever seen, so after a filtered connection ended, the trusted
+    # application that inherited its range was treated as ours -- windows
+    # readable, capturable, writable.  Found by the attack suite: a direct
+    # client was given 0xc00000, a base a filtered connection had held earlier
+    # in the same run, and GetImage on its window returned 4096 bytes.
+    profile = xfilter.PolicyProfile()
+    profile.note_range(BASE, MASK)
+    assert profile.is_foreign(BASE | 0x11) is False, "ours while it is ours"
+
+    profile.forget_range(BASE, MASK)
+    assert profile.is_foreign(BASE | 0x11) is True, \
+        "and a stranger's the moment the server may hand it to a stranger"
+
+    # an application's *other* connections keep theirs: the ranges are counted,
+    # not shared, so one closing does not disown the rest
+    profile.note_range(BASE, MASK)
+    profile.note_range(BASE, MASK)
+    profile.forget_range(BASE, MASK)
+    assert profile.is_foreign(BASE | 0x11) is False, \
+        "a sibling connection still holds this range"
+    profile.forget_range(BASE, MASK)
+    assert profile.is_foreign(BASE | 0x11) is True
+
+
+def test_a_denied_extension_answers_instead_of_hanging():
+    # A hidden extension is reported absent, so anything sent to its opcode is
+    # a guess at a number that is stable and guessable.  Dropping it silently
+    # left a reply-bearing request -- Composite's QueryVersion, say -- waiting
+    # for a reply that never came; found under Xephyr, which has Composite
+    # where Xvfb does not.  BadRequest is also what a server without the
+    # extension would answer, so the opcode now agrees with QueryExtension.
+    conn = make_connection(enforce=True)
+    conn.denied_opcodes = {142}
+    answer, reason = conn.judge(142, 0, b"")
+    assert callable(answer) and reason == "extension denied"
+    error = answer(9)
+    assert error[0] == 0, "an error, not a reply"
+    assert error[1] == xfilter.BAD_REQUEST, "the code a server with no such "\
+        "extension would send"
+    assert struct.unpack_from(LE + "H", error, 2)[0] == 9, "sequence consumed"
+    # an X error is type, code, sequence, bad value, minor (2 bytes), major
+    assert struct.unpack_from(LE + "H", error, 8)[0] == 0, "the minor opcode"
+    assert error[10] == 142, "and the major, so the client knows what failed"
+
+
 def test_screensaver_control_is_refused():
     conn = make_connection()
     assert conn.judge(107, 0, b"")[0] == "silent", "SetScreenSaver refused"
@@ -914,11 +1168,23 @@ def test_randr_reads_pass_and_writes_are_refused():
 def test_shape_cannot_reshape_a_foreign_window():
     conn = make_connection()
     conn.extension_opcodes = {141: "SHAPE"}
-    def combine(window):
-        return struct.pack(LE + "BBBxI", 0, 0, 0, window)
+    def combine(window, source=OWN):
+        # a whole one: operation, kinds, the destination window at offset 4,
+        # the offsets, and the source drawable at 12.  It used to be built
+        # eight bytes long, which stopped before the source -- and the policy
+        # skipped the gate it could not read.  Both ends are fixed now, so the
+        # request here is the length a client really sends.
+        return struct.pack(LE + "BBBxIhhI", 0, 0, 0, window, 0, 0, source)
     for minor in (1, 2, 3, 4):
         assert conn.judge(141, minor, combine(FOREIGN))[0] == "silent", minor
         assert conn.judge(141, minor, combine(OWN))[0] == "allow", minor
+        if minor in xfilter.SHAPE_SOURCE_DRAWABLES:
+            # 2 and 3 are gated on a *source* at offset 12 as well, so a body
+            # that stops at 8 cannot be judged and is refused rather than
+            # skipped.  1 and 4 carry only the destination, at offset 4, which
+            # is there -- a request is refused for the fields its gates read,
+            # not for being shorter than the protocol's full form.
+            assert conn.judge(141, minor, combine(OWN)[:8])[0] != "allow", minor
 
 
 def test_xfixes_cursor_is_answered_blank():
@@ -1186,6 +1452,223 @@ def test_property_notify_is_filtered_where_the_read_is_refused():
         "a requestor mid-transfer needs its PropertyNotify"
 
 
+def test_a_selection_grant_lives_while_the_transfer_is_moving():
+    """Twenty-sixth pass: sixty seconds bounds an *idle* grant, not a transfer.
+
+    A grant used to be minted once, at the SelectionRequest, and never
+    refreshed, so SELECTION_GRANT_SECONDS was a ceiling on the whole paste.
+    Big payloads do not cross in one request -- the owner answers with a type
+    of INCR and feeds the data in chunk by chunk, each chunk waiting for the
+    requestor to consume the last -- so a slow requestor ran the grant out
+    mid-transfer and both ends then waited for each other for ever.  Measured
+    with xclip: a nineteen-megabyte paste to a requestor taking five seconds a
+    chunk stopped after twelve of nineteen chunks, exactly sixty seconds in,
+    where the same transfer with no proxy completed.
+    """
+    conn = rooted_connection()
+    conn.profile.note_atom(300, "WM_NAME")
+    prop = 300
+
+    conn.grant_selection(FOREIGN, prop)
+    # wind the grant to the brink, the way a long transfer does
+    conn.selection_requests[(FOREIGN, prop)] = time.time() + 0.05
+    conn.selection_requestors[FOREIGN] = time.time() + 0.05
+
+    # the requestor taking another chunk is what resets the clock
+    assert conn.patch_event(property_notify(FOREIGN, prop)) is None, \
+        "the notification that a chunk was consumed must reach the owner"
+    # ...so the grant outlives the deadline it had when the event arrived
+    time.sleep(0.1)
+    assert conn.granted(conn.selection_requestors, FOREIGN), \
+        "a transfer still moving must not have its grant expire under it"
+    assert conn.granted(conn.selection_requests, (FOREIGN, prop)), \
+        "the write side of the same grant has to be renewed with it, or the "\
+        "owner keeps the event and loses the ChangeProperty that answers it"
+    assert conn.judge(18, 0, struct.pack(LE + "IIIBxxxI", FOREIGN, prop,
+                                         31, 8, 6) + b"chunk!")[0] == "allow", \
+        "the next chunk must still be allowed into the requestor's window"
+
+
+def test_a_selection_grant_cannot_be_renewed_by_the_client_itself():
+    """The reset is driven by the far side, and never revives a dead grant.
+
+    Two ways this could have gone wrong.  Renewing on the client's own writes
+    would let it hold a grant open by itself for ever, so the reset is hung on
+    the requestor consuming a chunk instead -- and a *forged* PropertyNotify
+    would be the client driving that too, the EV-7 trick the SelectionRequest
+    arm already refuses, so the SendEvent bit is checked here for the same
+    reason.  And an expired grant must stay expired: renewal extends
+    permission, it never mints it.
+    """
+    conn = rooted_connection()
+    conn.profile.note_atom(300, "WM_NAME")
+    prop = 300
+
+    # a grant that has run out is not brought back, by any event
+    conn.grant_selection(FOREIGN, prop)
+    conn.selection_requests[(FOREIGN, prop)] = time.time() - 1
+    conn.selection_requestors[FOREIGN] = time.time() - 1
+    assert conn.patch_event(property_notify(FOREIGN, prop)) is conn.DROP_EVENT, \
+        "an expired grant withholds the event"
+    assert not conn.renew_selection_grant(FOREIGN, prop), \
+        "renewal must not resurrect a grant that has already expired"
+    assert not conn.granted(conn.selection_requestors, FOREIGN)
+
+    # A live grant is not extended by an event the client forged itself --
+    # asserted against the genuine one in the same breath, so the test pins
+    # the *discrimination* rather than merely the absence of renewal.
+    for forged, lives_on in ((True, False), (False, True)):
+        conn.grant_selection(FOREIGN, prop)
+        conn.selection_requestors[FOREIGN] = time.time() + 0.05
+        conn.selection_requests[(FOREIGN, prop)] = time.time() + 0.05
+        event = bytearray(property_notify(FOREIGN, prop))
+        if forged:
+            event[0] |= 0x80                   # sent via SendEvent
+        conn.patch_event(bytes(event))
+        time.sleep(0.1)
+        assert conn.granted(conn.selection_requestors, FOREIGN) is lives_on, \
+            ("a client that forges the far side's PropertyNotify must not "
+             "thereby keep its own grant alive" if forged else
+             "the genuine notification must still renew it")
+
+
+def test_a_withheld_event_is_named_in_the_operation_log():
+    """Twenty-sixth pass: the policy's most visible act was its least logged.
+
+    Withholding an event is what makes an application hang rather than report
+    an error -- there is no reply for the server to turn into an X error -- and
+    it was the one thing the operation log did not record.  The generic-event
+    path has named its drops since the tenth pass; the fixed-event path beside
+    it returned DROP_EVENT into a bare `continue`.  The run that first measured
+    the INCR stall above ended with the log saying that nothing was blocked,
+    while the proxy was precisely what had stopped the transfer.
+    """
+    conn = rooted_connection()
+    conn.profile.note_atom(300, "WM_NAME")
+
+    assert conn.patch_event(property_notify(FOREIGN, 300)) is conn.DROP_EVENT
+    assert ("event:PropertyNotify", False) in conn.profile.first_seen, \
+        "a withheld event must be recorded, and as blocked"
+    assert conn.profile.first_seen[("event:PropertyNotify", False)][2] is False
+
+    # ...and recorded once, not once per event: the drop is on the hot path,
+    # so a stream of withheld events costs one entry and one set lookup.
+    before = len(conn.profile.first_seen)
+    for _ in range(5):
+        conn.patch_event(property_notify(FOREIGN, 300))
+    assert len(conn.profile.first_seen) == before, \
+        "the log is one line per (operation, verdict), not one per event"
+
+    # Each withheld channel is named separately, so a log reader can tell
+    # which one went quiet rather than seeing one anonymous "event" line.
+    # (The key-event drop is driven by who holds the focus, which needs the
+    # upstream connection this socketless connection does not have, so the
+    # labelling is exercised here and the drop itself on the wire.)
+    for label in ("event:KeyPress", "event:XKB2", "event:XI_KeyPress"):
+        conn.note_dropped_event(label)
+        assert (label, False) in conn.profile.first_seen, label
+
+
+def test_a_dry_run_reports_the_events_it_would_withhold():
+    """Twenty-seventh pass: --dry-run is the mode you look before you leap in.
+
+    The request path has always judged and logged under --dry-run while
+    registering no substitution, and the XGE path says the same thing in its
+    docstring -- the log still names it, which is the whole point of looking
+    before enforcing.  The fixed-event path kept only half of that: a blanket
+    early return skipped every arm, so a dry run neither withheld an event nor
+    worked out that it would have.  The drops the twenty-sixth pass had just
+    made visible were therefore visible only in the mode that also performs
+    them -- by which time the application has already hung.
+    """
+    conn = make_connection(enforce=False)
+    conn.root = ROOT
+    conn.roots = {ROOT}
+    conn.profile.note_atom(300, "WM_NAME")
+
+    # nothing is withheld...
+    assert conn.patch_event(property_notify(FOREIGN, 300)) is None, \
+        "a dry run must be byte-for-byte an unfiltered one on the wire"
+    # ...and the report says what enforcing would cost
+    assert ("event:PropertyNotify", False) in conn.profile.first_seen, \
+        "a dry run has to name the event it would have withheld"
+
+    # a rewriting arm is equally inert, and for the same reason: KeymapNotify
+    # is blanked under enforcement and must pass through untouched here
+    keymap = bytearray(32)
+    keymap[0] = 11
+    keymap[5] = 0x40                       # some key held down
+    assert conn.patch_event(bytes(keymap)) is None, \
+        "a dry run must not blank the keymap bitmap either"
+
+    # ...while the enforcing connection does both
+    live = rooted_connection()
+    live.profile.note_atom(300, "WM_NAME")
+    assert live.patch_event(property_notify(FOREIGN, 300)) is live.DROP_EVENT
+    assert live.patch_event(bytes(keymap)) is not None, \
+        "enforcing still blanks it"
+
+
+def test_an_unreadable_focus_does_not_hand_over_the_keyboard():
+    """Twenty-eighth pass: the keylogger defence must not fail open.
+
+    The twenty-third pass allowed the keyboard grab (refusing it stopped menus
+    opening) and bounded the *delivery* instead: a key event reaches this client
+    only while a window of its own holds the focus.  That question is asked on
+    the proxy's own upstream connection, and `_focus_is_ours` answered **True**
+    whenever it could not be asked -- no anchor, a dead one, a socket error, an
+    error reply.  So losing the oracle reinstated exactly the attack the rule
+    exists to stop: a client holding a grab is sent every keystroke, wherever
+    the user is typing.
+
+    Answering False unconditionally is not the fix: with no oracle every client
+    goes deaf, the focused one included.  The two cases are distinguishable,
+    though -- without a grab X delivers keys only to the focused window's chain,
+    so an unfocused client is not being sent any and withholding costs nothing;
+    with a grab it is being sent all of them.  So the unreadable case is "ours"
+    only for a client that is not holding the keyboard.
+    """
+    def key(code=2):
+        event = bytearray(32)
+        event[0] = code
+        return bytes(event)
+
+    saved_anchor, saved_cache = xfilter._anchor, xfilter._focus_cache
+    try:
+        xfilter._anchor = None                 # the focus cannot be read
+        xfilter._focus_cache = (0, 0)
+
+        plain = rooted_connection()
+        assert plain.patch_event(key()) is None, \
+            "a client with no grab must keep its own keys when the oracle is " \
+            "gone -- it is not being sent anyone else's"
+
+        for name, opcode, minor, body in (
+                ("GrabKeyboard", 31, 0,
+                 struct.pack(LE + "IHBB", OWN, 0, 0, 0) + b"\0" * 8),
+                ("XI1 GrabDevice", 131, 13, struct.pack(LE + "I", OWN) + b"\0" * 16),
+                ("XI2 XIGrabDevice", 131, 51, struct.pack(LE + "I", OWN) + b"\0" * 20)):
+            conn = rooted_connection()
+            conn.extension_opcodes = {131: "XInputExtension"}
+            conn.judge(opcode, minor, body)
+            assert conn.keyboard_grabbed, "%s must be remembered" % name
+            assert conn.patch_event(key()) is conn.DROP_EVENT, \
+                "%s + an unreadable focus is the keylogger" % name
+            assert conn.patch_event(key(3)) is conn.DROP_EVENT, name
+
+        # and the grab is given back when the menu closes
+        for opcode, minor in ((32, 0), (131, 14), (131, 52)):
+            conn = rooted_connection()
+            conn.extension_opcodes = {131: "XInputExtension"}
+            conn.judge(31, 0, struct.pack(LE + "IHBB", OWN, 0, 0, 0) + b"\0" * 8)
+            conn.judge(opcode, minor, b"\0" * 8)
+            assert not conn.keyboard_grabbed, \
+                "an ungrab has to clear it, or one menu marks the client for life"
+            assert conn.patch_event(key()) is None
+    finally:
+        xfilter._anchor, xfilter._focus_cache = saved_anchor, saved_cache
+
+
 def test_keymap_notify_is_answered_with_no_keys_down():
     """EV-5: the event twin of QueryKeymap, which is already answered blank.
 
@@ -1234,6 +1717,53 @@ def test_get_input_focus_hides_another_client_s_window():
     root = conn.scrub_foreign_windows(reply_naming(ROOT), b"", [8])
     assert struct.unpack_from(LE + "I", root, 8)[0] == ROOT, \
         "PointerRoot focus is not somebody's private window"
+
+
+class _Recorder:
+    """Stands in for the upstream socket: remembers what was forwarded."""
+
+    def __init__(self):
+        self.sent = []
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+
+class _Answer:
+    """Stands in for the user at the prompt."""
+
+    def __init__(self, said_yes):
+        self.said_yes = said_yes
+
+    def decide(self, *args, **kwargs):
+        return self.said_yes
+
+
+def _asked_and_answered(said_yes):
+    conn = make_connection(gate_mode="ask")
+    conn.gate = _Answer(said_yes)
+    conn.server = _Recorder()
+    conn.alert_new = False
+    head = struct.pack(LE + "BBH", 24, 0, 6)
+    conn.forward(24, 0, head, convert_selection(OWN, 100))
+    return conn
+
+
+def test_the_log_records_what_the_user_decided_not_that_they_were_asked():
+    # Twenty-fifth pass.  "ask" is a question, not an outcome, and logging it as
+    # one made the operation log say `core:ConvertSelection blocked` about a
+    # paste the user had just allowed -- measured end to end on a nested
+    # desktop, where the clipboard arrived in the filtered application while
+    # the log denied that it had.  The log is the record of what the policy
+    # did, so it is written after the answer.
+    allowed = _asked_and_answered(True)
+    verdicts = {key[1] for key in allowed.profile.first_seen}
+    assert verdicts == {True}, "the user said yes, so the log says allowed"
+    assert allowed.server.sent, "and the request went upstream"
+
+    refused = _asked_and_answered(False)
+    verdicts = {key[1] for key in refused.profile.first_seen}
+    assert verdicts == {False}, "the user said no, so the log says blocked"
 
 
 def test_the_gate_offers_the_setting_that_would_have_allowed_it():
@@ -2042,6 +2572,43 @@ def test_the_event_filter_does_not_wait_for_a_polite_client():
     assert conn.patch_event(xkb_event(0)) is None
 
 
+def test_dry_run_changes_nothing_in_the_event_stream():
+    # --dry-run reports what the policy would refuse and refuses nothing, and
+    # the request and reply paths keep that promise -- a substitution is only
+    # registered `if self.enforce`.  The event path did not, so a profiling run
+    # silently differed from an unfiltered one.  Found by the attack suite's
+    # own self-test: with enforcement off every check must go red, and this one
+    # stayed green.
+    conn = make_connection(enforce=False)
+    conn.root, conn.roots = ROOT, {ROOT}
+    conn.profile.note_extension(135, "XKEYBOARD", first_event=85)
+    conn.profile.note_atom(102, "WM_NAME")
+
+    state_notify = bytearray(32); state_notify[0] = 85; state_notify[1] = 2
+    keymap = bytearray(32); keymap[0] = 11; keymap[9] = 0xFF
+    property_notify = bytearray(32)
+    property_notify[0] = 28
+    struct.pack_into(LE + "II", property_notify, 4, FOREIGN, 102)
+
+    for event in (state_notify, keymap, property_notify):
+        assert conn.patch_event(bytes(event)) is None, \
+            "dry run watches; it does not withhold or rewrite"
+
+    # ...but it still learns, so the report it prints is about the real traffic
+    request = bytearray(32)
+    request[0] = 30                                   # SelectionRequest
+    struct.pack_into(LE + "I", request, 12, FOREIGN)
+    struct.pack_into(LE + "I", request, 24, 105)
+    conn.patch_event(bytes(request))
+    assert conn.granted(conn.selection_requestors, FOREIGN), \
+        "the grant is still recorded, so the dry run reports what would happen"
+
+    # the enforcing connection is unchanged
+    enforcing = rooted_connection()
+    enforcing.profile.note_extension(135, "XKEYBOARD", first_event=85)
+    assert enforcing.patch_event(bytes(state_notify)) is enforcing.DROP_EVENT
+
+
 def test_a_client_cannot_forge_a_line_of_the_operation_log():
     # Twelfth pass.  describe() is the client's own testimony about itself, and
     # it is printed to the operator's terminal, appended to the --log file and
@@ -2088,6 +2655,255 @@ def test_a_failed_request_releases_what_was_held_for_its_reply():
     assert not conn.reply_foreign and not conn.reply_pointer
     assert not conn.reply_leds and not conn.query_denied and not conn.listings
     conn.discard_sequence(7)          # a second error for the same sequence
+
+
+def grab_keyboard(window):
+    # owner-events is the header's data byte; the body is the grab window, the
+    # timestamp and the two modes
+    return struct.pack(LE + "IIBBxx", window, 0, 1, 1)
+
+
+def test_a_keyboard_grab_is_allowed_and_its_keystrokes_are_bounded():
+    # Twentieth pass, revised by measurement.  A client may grab the keyboard
+    # on a window of its own, and while the grab is held the server delivers
+    # every keystroke to it, whatever the user believes they are typing into.
+    # Refusing the grab was tried and cost too much: GTK asks for the pointer
+    # and the keyboard in one request, so a refusal stopped context menus
+    # opening at all (measured against gedit, which opened one at the pointer
+    # without the proxy and none through it).  So the grab is allowed and the
+    # delivery is bounded instead -- the same shape as the pointer grab.
+    conn = make_connection()
+    assert conn.judge(31, 0, grab_keyboard(OWN))[0] == "allow", \
+        "menus need this, and what it would steal is withheld elsewhere"
+    assert conn.judge(26, 0, struct.pack(LE + "IHBBIII", OWN, 0, 1, 1, 0, 0,
+                                         0))[0] == "allow", "so does drag"
+    # a foreign window was refused before this pass and still is
+    assert callable(conn.judge(31, 0, grab_keyboard(FOREIGN))[0])
+    assert callable(conn.judge(26, 0, struct.pack(LE + "IHBBIII", FOREIGN, 0,
+                                                  1, 1, 0, 0, 0))[0])
+
+
+def xi_grab_device(window, mask):
+    # window, time, cursor, deviceid, mode, paired mode, owner-events, pad,
+    # mask length in words, then the mask
+    return struct.pack(LE + "IIIHBBBxHI", window, 0, 0, 3, 1, 1, 0, 1, mask)
+
+
+def test_the_xinput_grab_is_the_same_keylogger_as_the_core_one():
+    # Twentieth pass, second half.  GTK and Qt grab through XInput2, so the
+    # XI2 spelling has to be treated exactly like the core one -- allowed, and
+    # bounded by the same delivery rule.
+    conn = make_connection()
+    conn.extension_opcodes = {131: "XInputExtension"}
+    keys = (1 << 2) | (1 << 3)                    # XI_KeyPress, XI_KeyRelease
+    assert conn.judge(131, 51, xi_grab_device(OWN, keys))[0] == "allow", \
+        "this is the request GTK opens every menu with"
+    assert conn.judge(131, 13, struct.pack(LE + "I", OWN))[0] == "allow"
+    # ...and both are still refused on somebody else's window
+    assert callable(conn.judge(131, 51, xi_grab_device(FOREIGN, keys))[0])
+    assert callable(conn.judge(131, 13, struct.pack(LE + "I", FOREIGN))[0])
+
+
+def _xi_motion(conn, window, event_x, event_y, root_x=700, root_y=500):
+    head = bytearray(32)
+    head[0] = 35                                  # generic event
+    head[1] = 131                                 # XInputExtension
+    struct.pack_into(LE + "H", head, 8, 6)        # XI_Motion
+    struct.pack_into(LE + "II", head, 24, window, 0x999)
+    body = bytearray(48)
+    struct.pack_into(LE + "iiii", body, 0, root_x << 16, root_y << 16,
+                     event_x << 16, event_y << 16)
+    for offset in range(24, 40, 4):
+        struct.pack_into(LE + "I", body, offset, 0x1F)      # modifiers
+    return bytes(head), bytes(body)
+
+
+def test_an_xinput_event_from_outside_our_window_carries_no_position():
+    # The generic-event twin of the core bound.  The tenth pass left this
+    # channel pass-or-drop on the grounds that an XGE's layout belongs to its
+    # extension -- true in general, and not of XI2's device events, whose
+    # shape the pointer bound already relies on for XIQueryPointer's reply.
+    conn = rooted_connection()
+    conn.extension_opcodes = {131: "XInputExtension"}
+    track_window(conn, OWN, 200, 100)
+
+    head, body = _xi_motion(conn, OWN, 50, 40)
+    assert conn.patch_generic_event(head, body) is None, \
+        "over its own window the client may have the position"
+
+    head, body = _xi_motion(conn, OWN, 50, 400)
+    patched = conn.patch_generic_event(head, body)
+    assert patched is not None and patched is not conn.DROP_EVENT
+    new_head, new_body = patched
+    assert struct.unpack_from(LE + "ii", new_body, 0) == (0, 0), \
+        "elsewhere on the desktop, the root position is withheld"
+    assert struct.unpack_from(LE + "I", new_head, 28)[0] == 0, "and the child"
+    assert struct.unpack_from(LE + "I", new_body, 24)[0] == 0, "and the modifiers"
+    assert struct.unpack_from(LE + "ii", new_body, 8) \
+        == (50 << 16, 400 << 16), "the window-relative position is untouched"
+
+
+def _key_event(code=2):
+    event = bytearray(32)
+    event[0] = code
+    return bytes(event)
+
+
+def test_a_key_event_arrives_only_while_we_hold_the_focus():
+    # Twentieth pass, third form.  Gating the grab cost too much (GTK menus
+    # stopped opening), so the grab is allowed and the *delivery* is bounded:
+    # a key event reaches the client only while a window of its own has the
+    # focus.  A menu belongs to an application the user is working in; a
+    # client watching from the background is not, and gets nothing.
+    conn = rooted_connection()
+    answers = []
+    conn_focus = lambda endian="<": answers.pop(0)
+    saved = xfilter.focus_window
+    xfilter.focus_window = conn_focus
+    try:
+        answers[:] = [OWN]
+        assert conn.patch_event(_key_event()) is None, "our window: delivered"
+        answers[:] = [ROOT]
+        assert conn.patch_event(_key_event()) is None, "the root is nobody's"
+        answers[:] = [1]
+        assert conn.patch_event(_key_event()) is None, "PointerRoot: delivered"
+        answers[:] = [FOREIGN]
+        assert conn.patch_event(_key_event()) is conn.DROP_EVENT, \
+            "somebody else is being typed into"
+        answers[:] = [0]
+        assert conn.patch_event(_key_event()) is conn.DROP_EVENT, \
+            "nobody holds the focus, so this key is nobody's -- and is_foreign "\
+            "reads 0 as None, which had this answering 'ours'"
+        answers[:] = [None]
+        assert conn.patch_event(_key_event()) is None, \
+            "no way to ask: do not make the client deaf"
+        for code in (2, 3):
+            answers[:] = [FOREIGN]
+            assert conn.patch_event(_key_event(code)) is conn.DROP_EVENT, code
+    finally:
+        xfilter.focus_window = saved
+
+
+def _motion_event(window, event_x, event_y, root_x=700, root_y=500):
+    event = bytearray(32)
+    event[0] = 6                                        # MotionNotify
+    struct.pack_into(LE + "III", event, 8, ROOT, window, 0x999)
+    struct.pack_into(LE + "hhhh", event, 20, root_x, root_y, event_x, event_y)
+    struct.pack_into(LE + "H", event, 28, 0x1F)         # modifier state
+    return bytes(event)
+
+
+def test_a_pointer_event_from_outside_our_window_carries_no_position():
+    # Twentieth pass.  A pointer grab on the client's own window makes the
+    # server report every motion, button and crossing event to it, wherever the
+    # pointer is -- the whole-desktop trace three earlier passes closed by
+    # other roads (measured: (200,150), (700,500), (1100,800) through the
+    # proxy).  The grab stays allowed, because menus and drag-and-drop need it;
+    # the position is bounded by the same test the reply side uses.
+    conn = rooted_connection()
+    track_window(conn, OWN, 200, 100)
+
+    inside = conn.patch_event(_motion_event(OWN, 50, 40))
+    assert inside is None, "over its own window, the client may have the position"
+
+    outside = conn.patch_event(_motion_event(OWN, 50, 400))
+    assert outside is not None
+    assert struct.unpack_from(LE + "hh", outside, 20) == (0, 0), \
+        "elsewhere on the desktop, the global position is withheld"
+    assert struct.unpack_from(LE + "I", outside, 16)[0] == 0, "and the child"
+    assert struct.unpack_from(LE + "H", outside, 28)[0] == 0, \
+        "and the modifiers, which are not ours to read off somebody else's work"
+
+    # an untracked or unmapped window proves nothing, so it is bounded too
+    unmapped = BASE | 0x81
+    conn.profile.note_window(unmapped, ROOT, 200, 100, False)
+    assert conn.patch_event(_motion_event(unmapped, 10, 10)) is not None
+    assert conn.patch_event(_motion_event(FOREIGN, 10, 10)) is not None
+
+    # every event that carries the position is covered, not just motion
+    for code in (4, 5, 7, 8):                # button press/release, enter/leave
+        event = bytearray(_motion_event(OWN, 50, 400))
+        event[0] = code
+        assert conn.patch_event(bytes(event)) is not None, code
+
+
+def test_every_screen_is_measured_against_itself():
+    # Twenty-first pass.  The spoof gate compared every window with the *first*
+    # screen's size, so a borderless window covering a second, smaller screen
+    # was fullscreen by no measure the policy took.  Measured on a two-screen
+    # server: 640x480 over the whole of screen 1 kept its override-redirect,
+    # while the same trick on screen 0 was stripped.  A laptop with a projector
+    # is the ordinary case here.
+    conn = fs_connection()
+    second_root = ROOT + 2
+    conn.roots = {ROOT, second_root}
+    conn.screen_size = {ROOT: (FS_W, FS_H), second_root: (640, 480)}
+
+    # the small screen, covered entirely
+    verdict, _ = conn.judge(1, 0, create_window(OWN, second_root, 640, 480,
+                                                override=1))
+    assert isinstance(verdict, tuple) and verdict[0] == "fullscreen", \
+        "a window covering the second screen is a fake desktop on it"
+
+    # the same size on the big screen is an ordinary window
+    assert conn.judge(1, 0, create_window(BASE | 0x91, ROOT, 640, 480,
+                                          override=1))[0] == "allow"
+
+    # and the tiling rule counts each screen separately
+    quiet = fs_connection()
+    quiet.roots = {ROOT, second_root}
+    quiet.screen_size = {ROOT: (FS_W, FS_H), second_root: (640, 480)}
+    tiles = []
+    for index in range(2):
+        window = BASE | (0xA0 + index)
+        assert quiet.judge(1, 0, create_window(window, second_root, 320, 480,
+                                               override=1))[0] == "allow"
+        tiles.append(window)
+    verdicts = [quiet.judge(8, 0, struct.pack(LE + "I", w))[0] for w in tiles]
+    assert any(isinstance(v, tuple) and v[0] == "fullscreen" for v in verdicts), \
+        "two tiles covering the second screen are gated there too"
+
+
+def test_a_fake_desktop_cannot_be_assembled_out_of_tiles():
+    # Nineteenth pass.  The gate asked whether *a* window covered the screen,
+    # so a fake desktop that is four windows walked past it: measured through
+    # the proxy with a window manager running, four override-redirect windows
+    # of half the screen's width and height each turned all four quadrants of
+    # the real screen the attacker's colour, logged only as CreateWindow and
+    # MapWindow allowed.
+    conn = fs_connection()
+    half_w, half_h = FS_W // 2, FS_H // 2
+    tiles = []
+    for index in range(4):
+        window = BASE | (0x60 + index)
+        assert conn.judge(1, 0, create_window(window, ROOT, half_w, half_h,
+                                              override=1))[0] == "allow", \
+            "a window of a quarter of the screen is not a fake desktop"
+        tiles.append(window)
+
+    mapped = 0
+    for window in tiles:
+        verdict = conn.judge(8, 0, struct.pack(LE + "I", window))[0]
+        if isinstance(verdict, tuple) and verdict[0] == "fullscreen":
+            break
+        assert verdict == "allow"
+        mapped += 1
+    assert mapped < len(tiles), "the last tile completes the covering and is gated"
+
+    # what is left is no more than one window is already allowed to cover, so
+    # splitting buys the attacker nothing
+    covered = mapped * half_w * half_h
+    one_window = int(FS_W * xfilter.FULLSCREEN_FRACTION) \
+        * int(FS_H * xfilter.FULLSCREEN_FRACTION)
+    assert covered <= one_window, \
+        "tiles must not cover more than a single allowed window could"
+
+    # and an ordinary menu is untouched
+    quiet = fs_connection()
+    menu = BASE | 0x70
+    assert quiet.judge(1, 0, create_window(menu, ROOT, SMALL_W, SMALL_H,
+                                           override=1))[0] == "allow"
+    assert quiet.judge(8, 0, struct.pack(LE + "I", menu))[0] == "allow"
 
 
 def test_ewmh_fullscreen_clientmessage_is_gated():

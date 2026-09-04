@@ -441,6 +441,22 @@ INPUT_EVENT_BITS = (0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 |
 # the PointerWindow/InputFocus destinations, which resolve to a trusted window.
 SYNTHETIC_INPUT_CODES = frozenset({2, 3, 4, 5, 6})
 
+#: Core events that carry a keystroke.  They are delivered only while a window
+#: of the application holds the focus: see PolicyConnection._focus_is_ours.
+KEY_EVENT_CODES = frozenset({2, 3})
+
+# Names for the fixed events patch_event can withhold, for the one line the
+# operation log prints when it does.  Only droppable events need a name;
+# anything else is labelled by its code.
+DROPPABLE_EVENT_NAMES = {2: "KeyPress", 3: "KeyRelease", 28: "PropertyNotify"}
+
+# Core events that carry the pointer's position: ButtonPress, ButtonRelease,
+# MotionNotify, EnterNotify, LeaveNotify.  Each has the same shape past its
+# header -- root window at 8, event window at 12, child at 16, the root-relative
+# position at 20, the window-relative one at 24, the modifier state at 28 --
+# which is what lets one rule bound all five.
+POINTER_EVENT_CODES = frozenset({4, 5, 6, 7, 8})
+
 # Event-mask bits that reach outside the client through the *event* stream
 # rather than through a reply, and so are refused on a window the client does
 # not own -- the root included, which is where both of them matter.
@@ -906,11 +922,76 @@ UNOWNED_ATOM = 43
 NOOP = 127
 GET_INPUT_FOCUS = 43
 BAD_ACCESS = 10
+#: What a server answers when it has never heard of a request's major opcode.
+#: It is what a client would get from a server that genuinely lacked a hidden
+#: extension, which is why refusing one is answered with it.
+BAD_REQUEST = 1
 
 
 #: The upstream connection the startup learning runs on, kept open for the life
 #: of the proxy.  It is deliberately never closed: see _learn_setup.
 _anchor = None
+_anchor_lock = threading.Lock()
+_focus_cache = (0.0, None)
+
+#: How long the answer to "who has the focus?" is reused.  Short: the question
+#: is asked on a local socket and only while events are arriving, and a stale
+#: answer is a keystroke delivered to the wrong client.  Measured at 50ms, the
+#: first key after a focus change slipped through; at 10ms it does not, and a
+#: burst of typing still asks only a hundred times a second at worst.
+FOCUS_CACHE_SECONDS = 0.01
+
+
+def focus_window(endian="<"):
+    """Which window the *server* says has the input focus, or None.
+
+    Asked on the proxy's own upstream connection, which is what makes it
+    usable: the proxy cannot inject a request into a client's stream without
+    desynchronising every reply after it, but the anchor connection it already
+    holds open for startup learning is a client of its own, and a question
+    asked there costs the filtered client nothing.
+
+    This is what lets a keyboard grab be *allowed* -- menus need it -- while
+    the keystrokes it would steal are withheld: a key event is delivered only
+    while a window of this application holds the focus, which is the same
+    "the user is working in this application" test the whole policy rests on.
+    """
+    global _focus_cache
+    now = time.time()
+    when, window = _focus_cache
+    if now - when < FOCUS_CACHE_SECONDS:
+        return window
+    with _anchor_lock:
+        if _anchor is None:
+            return None
+        try:
+            _anchor.sendall(struct.pack(endian + "BBH", GET_INPUT_FOCUS, 0, 1))
+            # Read past anything that is not the reply.  The anchor is an
+            # ordinary client, so the server sends it unsolicited events --
+            # MappingNotify goes to everybody when a keymap changes -- and
+            # reading one *as* the reply made this answer "I don't know",
+            # which the caller reads as "the client's own window has focus".
+            # Measured: exactly one keystroke of a captured word survived,
+            # every time, because one MappingNotify arrived per run.  A
+            # fail-open in the machinery written to close a fail-open.
+            window = None
+            while True:
+                message = read_exactly(_anchor, 32)
+                if not message:
+                    return None
+                if message[0] == 1:                      # the reply
+                    window = struct.unpack_from(endian + "I", message, 8)[0]
+                    break
+                if message[0] == 0:                      # an error
+                    return None
+                if message[0] & 0x7F == 35:              # a generic event
+                    extra = struct.unpack_from(endian + "I", message, 4)[0] * 4
+                    if extra:
+                        read_exactly(_anchor, extra)
+        except OSError:
+            return None
+    _focus_cache = (now, window)
+    return window
 
 
 def _learn_setup(target, cookie):
@@ -1203,7 +1284,9 @@ class Gate:
 
         owning = action == "own"
         fullscreen = action == "fullscreen"
+        keyboard = action == "keyboard"
         title = ("Fullscreen request" if fullscreen
+                 else "Keyboard request" if keyboard
                  else "Clipboard ownership request" if owning
                  else "Clipboard request")
         dialog = Gtk.Dialog(title=title, modal=False)
@@ -1217,7 +1300,7 @@ class Gate:
         box.set_border_width(12)
         # The clipboard prompts show the selection's current contents; the
         # fullscreen prompt has nothing to fetch.
-        value = "" if fullscreen else fetch_selection(
+        value = "" if fullscreen or keyboard else fetch_selection(
             self.display, self.xauth, selection)
         heading = Gtk.Label(xalign=0)
         # The bold name is the client's own claim about itself and can say
@@ -1231,6 +1314,13 @@ class Gate:
             what = ("wants to take over the whole screen with a borderless "
                     "window\n<i>a remote client doing this could spoof a login "
                     "prompt; denying leaves it a normal framed window</i>")
+        elif keyboard:
+            # A keyboard grab is what a menu takes so that arrow keys reach it
+            # -- and while it is held, every key you press goes to this client
+            # whatever you think you are typing into.
+            what = ("wants to grab the keyboard\n<i>while it holds one, "
+                    "everything you type goes to it, whatever window you are "
+                    "typing into; menus in this application need it</i>")
         elif owning:
             # Taking ownership is not reading: what is shown below is what the
             # user currently has copied and would lose, and afterwards every
@@ -1247,7 +1337,7 @@ class Gate:
                GLib.markup_escape_text(peer)))
         box.add(heading)
 
-        if not fullscreen:
+        if not (fullscreen or keyboard):
             view = Gtk.TextView(editable=False, cursor_visible=False,
                                 wrap_mode=Gtk.WrapMode.WORD)
             view.get_buffer().set_text(
@@ -1295,6 +1385,7 @@ class PolicyProfile(Profile):
         self.first_seen = {}      # key -> (identity, peer, passed, reason)
         self.log_file = None
         self.gate_hinted = False  # the --gate hint is offered once per run
+        self.focus_oracle_reported = False   # ...and the lost-focus warning
         # The application's own windows, as the policy understands them.
         #
         # This is *profile* state, not connection state, and that is the
@@ -1316,14 +1407,20 @@ class PolicyProfile(Profile):
         # with its subtree: the model used to be write-only, growing for the
         # life of the connection whatever the client destroyed, which both
         # leaked memory and left stale sizes behind ids the server had freed.
-        self.windows = {}         # window id -> [w, h, override, mapped, parent]
+        self.windows = {}         # window id -> [w, h, override, mapped, parent, root]
         self.children = {}        # parent id -> set of tracked child ids
 
-    def note_window(self, window, parent, width, height, override):
-        """A window the application just created."""
+    def note_window(self, window, parent, width, height, override, root=0):
+        """A window the application just created.
+
+        `root` is the screen it lives on -- a window is "fullscreen" only
+        against the screen it is actually on, and a server with two screens is
+        an ordinary desktop.
+        """
         with self.lock:
             self._forget(window)
-            self.windows[window] = [width, height, override, False, parent]
+            self.windows[window] = [width, height, override, False, parent,
+                                    root]
             self.children.setdefault(parent, set()).add(window)
 
     def note_geometry(self, window, width, height):
@@ -1378,11 +1475,38 @@ class PolicyProfile(Profile):
             if state is not None:
                 self.children.get(state[4], set()).discard(current)
 
+    def override_area_by_screen(self):
+        """Total area of the application's mapped override-redirect windows.
+
+        The fullscreen gate asks whether *a* window covers the screen, and a
+        fake desktop does not have to be one window: four override-redirect
+        windows, each half the screen's width and half its height, are none of
+        them fullscreen and together they are the whole screen.  Measured --
+        through the proxy, with a window manager running, four such windows
+        turned every quadrant of the real screen the attacker's colour, and the
+        operation log said only `CreateWindow allowed`, `MapWindow allowed`.
+        So the gate needs a number that adds up, and this is it.
+
+        Area rather than a union of rectangles: overlapping windows are counted
+        twice, so this over-estimates coverage and can only gate early, never
+        late.  Menus and tooltips -- the override-redirect windows a real
+        application makes -- are small, and a few of them come nowhere near the
+        threshold.
+        """
+        totals = {}
+        with self.lock:
+            for state in self.windows.values():
+                if state[2] and state[3]:
+                    totals[state[5]] = totals.get(state[5], 0) \
+                        + state[0] * state[1]
+        return totals
+
     def window_state(self, window):
-        """(width, height, override, mapped) for a tracked window, else None."""
+        """(width, height, override, mapped, parent, root) for a tracked
+        window, else None."""
         with self.lock:
             state = self.windows.get(window)
-            return None if state is None else tuple(state[:4])
+            return None if state is None else tuple(state)
 
     def note_allowed_paste(self, identity, selection):
         with self.lock:
@@ -1399,6 +1523,29 @@ class PolicyProfile(Profile):
             if key in self.first_seen:
                 return False
             self.first_seen[key] = (identity, peer, passed, reason)
+        return True
+
+    def note_focus_oracle_lost(self):
+        """Say once that the focus oracle is gone, because the policy is now
+        degraded and silence about that is how a security tool lies.
+
+        Twenty-eighth pass.  The focus question is asked on the proxy's own
+        upstream connection; if that connection is missing or has died, the
+        answer is "I don't know", and a client holding a keyboard grab is then
+        withheld its keys rather than handed everybody's.  That is the safe
+        direction, but it is also a *changed* behaviour the operator has to be
+        able to see -- a menu that stops taking arrow keys has a cause, and it
+        should be findable in the log rather than mysterious.
+        """
+        with self.lock:
+            if self.focus_oracle_reported:
+                return False
+            self.focus_oracle_reported = True
+        line = ("the focus oracle is unavailable: keystrokes are being withheld "
+                "from clients holding a keyboard grab, because the proxy can no "
+                "longer tell whose window is focused")
+        print(line, file=sys.stderr)
+        self.log_line(line)
         return True
 
     def note_gate_hint(self):
@@ -1516,6 +1663,13 @@ class PolicyConnection(Connection):
         # monitor on the window that asked for it.  Each is a deadline.
         self.selection_requests = {}   # (window, property) -> expiry
         self.selection_requestors = {}  # window -> expiry
+        # Twenty-eighth pass.  Whether this connection is holding an active
+        # keyboard grab, in any of its three spellings.  It is the one state
+        # that distinguishes "this client cannot be receiving somebody else's
+        # keystrokes" from "this client is receiving all of them", and the
+        # focus rule needs it for the case where the focus itself cannot be
+        # read -- see _focus_is_ours.
+        self.keyboard_grabbed = False
         self.identity = {}            # class / name / pid / host
         self.listings = set()         # sequences of ListExtensions requests
         self.root = 0
@@ -1524,6 +1678,7 @@ class PolicyConnection(Connection):
         self.root_visual = 0          # first screen's root visual id
         self.screen_width = 0         # first screen's width in pixels
         self.screen_height = 0        # first screen's height in pixels
+        self.screen_size = {}         # root window -> that screen's size
         # The model of the application's own windows -- their size, whether
         # they are override-redirect, whether they are mapped -- lives on the
         # *profile*, shared by every connection of the application, because
@@ -1670,9 +1825,13 @@ class PolicyConnection(Connection):
             return False
         return self.is_foreign(self.word(body, offset))
 
-    #: How long a selection grant lives.  Long enough for a transfer the user
-    #: asked for, including an INCR one with a slow requestor; short enough
-    #: that it is an answer to a request rather than a standing permission.
+    #: How long a selection grant lives *without being used*.  Long enough
+    #: for a transfer the user asked for, including an INCR one with a slow
+    #: requestor; short enough that it is an answer to a request rather than a
+    #: standing permission.  The clock is reset by renew_selection_grant every
+    #: time the requestor takes another chunk, so this bounds an *idle* grant,
+    #: not the length of a transfer -- see that method for why the difference
+    #: matters and why the reset cannot be driven by the client.
     SELECTION_GRANT_SECONDS = 60
 
     def grant_selection(self, window, prop):
@@ -1693,6 +1852,44 @@ class PolicyConnection(Connection):
         """True while a grant recorded by grant_selection is still live."""
         with self.lock:
             return table.get(key, 0) > time.time()
+
+    def renew_selection_grant(self, window, prop):
+        """Restart the clock on a grant that is still being used.
+
+        Twenty-sixth pass.  A grant was minted once, at the SelectionRequest,
+        and never refreshed, so sixty seconds was a ceiling on the whole
+        transfer rather than on an idle one.  A big clipboard payload does not
+        cross in one request: the owner answers with a type of INCR and then
+        feeds the data in chunk by chunk, each chunk written into the
+        requestor's window and each one waiting for the requestor to consume
+        the last.  That takes as long as the requestor is slow, and when the
+        grant died mid-transfer the writes were dropped and both sides waited
+        for each other for ever.  Measured: a nineteen-megabyte paste to a
+        requestor taking five seconds a chunk stopped dead after twelve of
+        nineteen chunks -- exactly sixty seconds in -- where the same transfer
+        with no proxy in the path completed.
+
+        What resets the clock is deliberately *not* the client's own writes,
+        which would let it hold a grant open by itself for ever.  It is the
+        requestor consuming a chunk -- a server-generated PropertyNotify from
+        the far side, which the filtered client cannot forge (a SendEvent one
+        arrives with the 0x80 bit set, and patch_event checks it there for the
+        same reason it checks it on SelectionRequest).  So the grant lives
+        while the other end keeps asking for more and dies sixty seconds after
+        it stops.
+
+        A dead grant is never revived: this only extends one that is still
+        live, so there is no path here from "no permission" to "permission".
+        """
+        now = time.time()
+        with self.lock:
+            if self.selection_requestors.get(window, 0) <= now:
+                return False
+            deadline = now + self.SELECTION_GRANT_SECONDS
+            self.selection_requestors[window] = deadline
+            if (window, prop) in self.selection_requests:
+                self.selection_requests[(window, prop)] = deadline
+            return True
 
     def is_gated_selection(self, atom):
         """True for CLIPBOARD/PRIMARY/SECONDARY, by id or by known name.
@@ -1733,16 +1930,26 @@ class PolicyConnection(Connection):
             for _ in range(screens):
                 if len(setup_body) < offset + 40:
                     break
-                self.roots.add(self.word(setup_body, offset))
-                if self.word(setup_body, offset) == self.root:
+                root = self.word(setup_body, offset)
+                self.roots.add(root)
+                # SCREEN width/height-in-pixels sit at offset +20 and +22, and
+                # are what "fullscreen" is measured against -- *per screen*.
+                # Keeping only the first screen's meant every window was judged
+                # against that one, so a borderless window covering a second,
+                # smaller screen was not fullscreen by any measure the policy
+                # took: measured on a two-screen server, 640x480 over the whole
+                # of screen 1 came back with its override-redirect intact while
+                # the same trick on screen 0 was stripped.  A laptop with a
+                # projector is the ordinary case here, not an exotic one.
+                width = struct.unpack_from(
+                    self.endian + "H", setup_body, offset + 20)[0]
+                height = struct.unpack_from(
+                    self.endian + "H", setup_body, offset + 22)[0]
+                self.screen_size[root] = (width, height)
+                if root == self.root:
                     self.root_depth = setup_body[offset + 38]
                     self.root_visual = self.word(setup_body, offset + 32)
-                    # SCREEN width/height-in-pixels sit at offset +20 and +22;
-                    # they are what "fullscreen" is measured against.
-                    self.screen_width = struct.unpack_from(
-                        self.endian + "H", setup_body, offset + 20)[0]
-                    self.screen_height = struct.unpack_from(
-                        self.endian + "H", setup_body, offset + 22)[0]
+                    self.screen_width, self.screen_height = width, height
                 depths = setup_body[offset + 39]
                 offset += 40
                 for _ in range(depths):
@@ -1765,13 +1972,25 @@ class PolicyConnection(Connection):
 
     # -- fullscreen-overlay detection (spoofing defence) -------------------
 
-    def _is_fullscreen(self, width, height):
-        """True if a window this size covers most of the screen -- the size a
-        desktop-spoof overlay wants.  Unknown screen size answers False."""
-        sw, sh = self.screen_width, self.screen_height
+    def _is_fullscreen(self, width, height, root=None):
+        """True if a window this size covers most of **its own** screen -- the
+        size a desktop-spoof overlay wants.  Unknown screen size answers False.
+
+        The screen matters: judging every window against the first one left a
+        second, smaller screen with no spoof defence at all.
+        """
+        sw, sh = self.screen_size.get(root, (self.screen_width,
+                                             self.screen_height))
         return (bool(sw) and bool(sh)
                 and width >= sw * FULLSCREEN_FRACTION
                 and height >= sh * FULLSCREEN_FRACTION)
+
+    def _screen_of(self, parent):
+        """The root of the screen a window created under `parent` is on."""
+        if parent in self.roots:
+            return parent
+        state = self.profile.window_state(parent)
+        return state[5] if state else self.root
 
     def _value_offset(self, base, mask, bit):
         """Byte offset of `bit`'s value in a value-list at `base`: values appear
@@ -1812,6 +2031,29 @@ class PolicyConnection(Connection):
             return None
         return (state[0], state[1])
 
+    def _covered_in_pieces(self):
+        """The gate verdict when the client's override-redirect windows cover
+        the screen *between them*, or None.
+
+        The threshold is the area a single window of FULLSCREEN_FRACTION in
+        each dimension would have, so the rule that catches one window and the
+        rule that catches four agree about how much of the screen is too much.
+        The model records what the client asked for rather than what it got --
+        the convention the override-redirect tracking already follows -- so a
+        refused map leaves its window counted, and the next one is gated too.
+        That is the fail-closed direction, and the operation log names it.
+        """
+        for root, covered in self.profile.override_area_by_screen().items():
+            width, height = self.screen_size.get(
+                root, (self.screen_width, self.screen_height))
+            if not (width and height):
+                continue
+            if covered >= width * height * FULLSCREEN_FRACTION ** 2:
+                return (("fullscreen", None),
+                        "override-redirect windows covering a screen "
+                        "between them")
+        return None
+
     def judge_fullscreen(self, opcode, body):
         """Track own windows' size and override-redirect state, and gate the
         request that would tip one into a fullscreen override-redirect overlay
@@ -1830,10 +2072,13 @@ class PolicyConnection(Connection):
             override = False
             if mask & CW_OVERRIDE_REDIRECT:
                 offset = self._value_offset(28, mask, CW_OVERRIDE_REDIRECT)
-                override = bool(len(body) >= offset + 4 and self.word(body, offset))
+                if len(body) < offset + 4:
+                    return "silent", "unreadable window attributes"
+                override = bool(self.word(body, offset))
+            root = self._screen_of(self.word(body, 4))
             self.profile.note_window(window, self.word(body, 4),
-                                     width, height, override)
-            if override and self._is_fullscreen(width, height):
+                                     width, height, override, root)
+            if override and self._is_fullscreen(width, height, root):
                 return (("fullscreen",
                          self._stripped_override(body, 28, mask)),
                         "override-redirect fullscreen window")
@@ -1844,16 +2089,32 @@ class PolicyConnection(Connection):
             mask = self.word(body, 4)
             if mask & CW_OVERRIDE_REDIRECT:
                 offset = self._value_offset(8, mask, CW_OVERRIDE_REDIRECT)
-                if len(body) >= offset + 4:
-                    if self.word(body, offset):
-                        self.profile.note_override(window, True)
-                        width, height = self._tracked_size(window)
-                        if self._is_fullscreen(width, height):
-                            return (("fullscreen",
-                                     self._stripped_override(body, 8, mask)),
-                                    "override-redirect fullscreen window")
-                    else:
-                        self.profile.note_override(window, False)
+                if len(body) < offset + 4:
+                    # The value list stops before the word this gate reads, so
+                    # the gate cannot run.  Refuse rather than skip: it is the
+                    # fail-open the seventeenth pass swept out of the
+                    # resource-id gates, here in the value-list mechanism -- and
+                    # this is the gate that keeps a borderless window off the
+                    # whole screen.  Such a request is malformed anyway, since X
+                    # wants exactly one word per mask bit, but that is the
+                    # server's reasoning and not one the policy may lean on.
+                    return "silent", "unreadable window attributes"
+                if self.word(body, offset):
+                    self.profile.note_override(window, True)
+                    width, height = self._tracked_size(window)
+                    state = self.profile.window_state(window)
+                    if self._is_fullscreen(width, height,
+                                           state[5] if state else None):
+                        return (("fullscreen",
+                                 self._stripped_override(body, 8, mask)),
+                                "override-redirect fullscreen window")
+                    if self._covered_in_pieces():
+                        return (("fullscreen",
+                                 self._stripped_override(body, 8, mask)),
+                                "override-redirect windows covering the "
+                                "screen between them")
+                else:
+                    self.profile.note_override(window, False)
         elif opcode == 12 and len(body) >= 8:          # ConfigureWindow
             window = self.word(body, 0)
             if self.is_foreign(window):
@@ -1861,13 +2122,15 @@ class PolicyConnection(Connection):
             mask = struct.unpack_from(self.endian + "H", body, 4)[0]
             state = self.profile.window_state(window)
             width, height = (state[0], state[1]) if state else (0, 0)
-            if mask & CONFIGURE_WIDTH:
-                off = self._value_offset(8, mask, CONFIGURE_WIDTH)
-                if len(body) >= off + 4:
+            for bit in (CONFIGURE_WIDTH, CONFIGURE_HEIGHT):
+                if not mask & bit:
+                    continue
+                off = self._value_offset(8, mask, bit)
+                if len(body) < off + 4:      # unreadable: refuse, do not skip
+                    return "silent", "unreadable window configuration"
+                if bit == CONFIGURE_WIDTH:
                     width = self.word(body, off) & 0xFFFF
-            if mask & CONFIGURE_HEIGHT:
-                off = self._value_offset(8, mask, CONFIGURE_HEIGHT)
-                if len(body) >= off + 4:
+                else:
                     height = self.word(body, off) & 0xFFFF
             self.profile.note_geometry(window, width, height)
             # An untracked window is treated as override-redirect here rather
@@ -1875,7 +2138,12 @@ class PolicyConnection(Connection):
             # server having freed it or by the id being one we never saw
             # created, and neither is a reason to hand back the gate.
             override = state[2] if state else True
-            if override and self._is_fullscreen(width, height):
+            root = state[5] if state else None
+            if override and not self._is_fullscreen(width, height, root):
+                covered = self._covered_in_pieces()
+                if covered is not None:
+                    return covered
+            if override and self._is_fullscreen(width, height, root):
                 # Override-redirect cannot be cleared by ConfigureWindow, so the
                 # resize itself is dropped: the overlay never reaches fullscreen.
                 return (("fullscreen", None),
@@ -1912,18 +2180,30 @@ class PolicyConnection(Connection):
                 return offset
         return None
 
-    def _fullscreen_allowed(self):
-        """Whether an untrusted client may take over the whole screen, by the
-        same --gate the clipboard uses: allow always, ask puts it to the user
-        (blocking this connection thread on the prompt, as a paste does), deny
-        (the default) refuses.  Reached only when enforcing."""
+    def _takeover_allowed(self, action, what):
+        """Whether an untrusted client may take something the whole session
+        shares, by the same --gate the clipboard uses: allow always, ask puts
+        it to the user (blocking this connection thread on the prompt, as a
+        paste does), deny (the default) refuses.  Reached only when enforcing.
+
+        Two things go through it.  The screen, which a borderless window can
+        cover; and the **keyboard**, which any client may grab on a window of
+        its own -- and while an active grab is held the server delivers every
+        keystroke to the grabbing client, wherever the user is typing.  That
+        is the keylogger this whole project exists to prevent, reached without
+        naming a foreign window, an extension, or the root: measured through
+        the proxy, a client grabbed the keyboard on a window of its own and
+        read back the keycodes for a word typed somewhere else entirely.
+        """
         if self.gate_mode == "allow":
             return True
         if self.gate_mode == "ask" and self.gate is not None:
-            return self.gate.decide(self.conn_token, self.describe(),
-                                    "the whole screen", "fullscreen",
-                                    self.peer_label(), action="fullscreen")
+            return self.gate.decide(self.conn_token, self.describe(), what,
+                                    action, self.peer_label(), action=action)
         return False
+
+    def _fullscreen_allowed(self):
+        return self._takeover_allowed("fullscreen", "the whole screen")
 
     def inspect(self, opcode, minor, body):
         """Learn extension opcodes and atom names, and nothing else.
@@ -1946,7 +2226,18 @@ class PolicyConnection(Connection):
         """
         if opcode >= 128:
             if opcode in self.denied_opcodes:
-                return "silent", "extension denied"
+                # Answered rather than dropped.  A client is told these
+                # extensions are absent, so anything addressed to one is either
+                # a guess at its (stable, guessable) opcode or a bug -- and
+                # dropping it silently left a reply-bearing request waiting for
+                # a reply that never came: measured under Xephyr, which unlike
+                # Xvfb actually has Composite, an attacker that guessed the
+                # opcode and asked its QueryVersion simply hung.  BadRequest is
+                # also the *truthful* answer: it is exactly what a server with
+                # no such extension would send, so the opcode agrees with what
+                # QueryExtension said instead of behaving like nothing at all.
+                return ((lambda seq: self.error(seq, BAD_REQUEST, opcode, minor)),
+                        "extension denied")
             name = self.extension_opcodes.get(opcode) \
                 or self.profile.extension_name(opcode)
             # One dispatch, one allowlist: an extension is admitted iff it has
@@ -2022,10 +2313,8 @@ class PolicyConnection(Connection):
             return "allow", None
 
         if opcode in CURSOR_SOURCE_REQUESTS:
-            for offset in CURSOR_SOURCE_REQUESTS[opcode]:
-                if len(body) >= offset + 4 and \
-                        self.is_foreign(self.word(body, offset)):
-                    return "silent", "cursor built from a foreign resource"
+            if self.names_foreign(CURSOR_SOURCE_REQUESTS, opcode, body):
+                return "silent", "cursor built from a foreign resource"
             return "allow", None
 
         if opcode == 14:                                   # GetGeometry
@@ -2069,10 +2358,8 @@ class PolicyConnection(Connection):
             return "allow", None
 
         if opcode in FOREIGN_RESOURCE_REQUESTS:
-            for offset in FOREIGN_RESOURCE_REQUESTS[opcode]:
-                if len(body) >= offset + 4 and \
-                        self.is_foreign(self.word(body, offset)):
-                    return "silent", "names another client's resource"
+            if self.names_foreign(FOREIGN_RESOURCE_REQUESTS, opcode, body):
+                return "silent", "names another client's resource"
             return "allow", None
 
         if opcode == 51:                                   # SetFontPath
@@ -2106,6 +2393,11 @@ class PolicyConnection(Connection):
             window = self.word(body, 0)
             if opcode in (8, 9):                           # Map[Sub]Windows
                 self.profile.note_mapped(window, True, subwindows=opcode == 9)
+                # Mapping is where a covering becomes a fake desktop: the
+                # windows exist unmapped without covering anything.
+                covered = self._covered_in_pieces()
+                if covered is not None:
+                    return covered
             elif opcode in (10, 11):                       # Unmap[Sub]Windows
                 self.profile.note_mapped(window, False, subwindows=opcode == 11)
             elif opcode in (4, 5):                         # Destroy[Sub]Windows
@@ -2182,6 +2474,24 @@ class PolicyConnection(Connection):
                 # status = AlreadyGrabbed, an outcome every client handles
                 return ((lambda seq: self.reply(seq, first=1)),
                         "grab on foreign window")
+            # A keyboard grab on the client's own window steals every
+            # keystroke in the session while it is held -- measured, a word
+            # typed elsewhere came back as keycodes.  Refusing it was tried
+            # and measured too, and costs more than it is worth: GTK asks for
+            # the pointer and the keyboard in one request, so a refusal makes
+            # menus not open at all, which is what a person would call broken.
+            #
+            # So the grab is allowed and the *delivery* is bounded instead,
+            # exactly as the pointer grab's positions are: a key event reaches
+            # this client only while a window of its own holds the focus (see
+            # patch_event).  A menu is opened by an application the user is
+            # working in, so it keeps its keys; a client watching from the
+            # background is not, so it gets nothing.
+            self.keyboard_grabbed = True
+            return "allow", None
+
+        if opcode == 32:                                   # UngrabKeyboard
+            self.keyboard_grabbed = False
             return "allow", None
 
         if opcode in (28, 33, 29, 34):    # Grab/Ungrab {Button,Key}
@@ -2393,6 +2703,30 @@ class PolicyConnection(Connection):
 
     # -- extension argument inspection -------------------------------------
 
+    #: XI2 event bits for a key going down or coming up.  A grab that asks for
+    #: these is asking for the keyboard, whatever device id it names.
+    XI_KEY_EVENTS = (1 << 2) | (1 << 3)
+
+    def _xi_mask_wants_keys(self, body):
+        """True if an XIGrabDevice body asks for key events.
+
+        The request ends with a mask, its length in words at offset 18 and the
+        words themselves at 20.  A body too short to carry the mask answers
+        True: a grab whose terms cannot be read is not one to allow.
+        """
+        if len(body) < 20:
+            return True
+        words = struct.unpack_from(self.endian + "H", body, 18)[0]
+        if not words:
+            return True                  # a grab that names no events at all
+        for index in range(words):
+            offset = 20 + 4 * index
+            if len(body) < offset + 4:
+                return True
+            if index == 0 and self.word(body, offset) & self.XI_KEY_EVENTS:
+                return True
+        return False
+
     def _mask_is_input_tap(self, body):
         """True if an XISelectEvents body asks for any event that leaks input.
 
@@ -2418,19 +2752,33 @@ class PolicyConnection(Connection):
     def names_foreign_window(self, table, opcode, body):
         """As names_foreign, but a root window is nobody's -- see
         is_foreign_window."""
-        for offset in table.get(opcode, ()):
-            if len(body) >= offset + 4 and \
-                    self.is_foreign_window(self.word(body, offset)):
-                return True
-        return False
+        return self._names(table, opcode, body, self.is_foreign_window)
 
     def names_foreign(self, table, minor, body):
         """True if any resource this extension request names is another
         client's.  The table maps a minor opcode to the body offsets that
         carry a resource id, skipping the server-allocated ones."""
-        for offset in table.get(minor, ()):
-            if len(body) >= offset + 4 and \
-                    self.is_foreign(self.word(body, offset)):
+        return self._names(table, minor, body, self.is_foreign)
+
+    def _names(self, table, key, body, foreign):
+        """True if a gated field is foreign **or unreadable**.
+
+        The second half is the point.  These loops used to skip an offset the
+        body was too short to hold -- `len(body) >= offset + 4 and ...` -- and
+        fall out of the bottom as "names nothing foreign", which is a
+        fail-open: a request the policy could not read was forwarded on the
+        strength of having read nothing.  The same shape was found by hand
+        twice before (XKB's GetDeviceInfo, the foreign-window event mask) and
+        fixed where it was found; a sweep of every gated request against every
+        truncation of its body found the rest, all in these two helpers and
+        their core equivalents.  Nothing was exploitable through them -- a
+        request too short for a field at offset 0 is one the server rejects as
+        BadLength -- but "the server would have caught it" is not a rule the
+        policy gets to rely on, and it is the exact fail-open this file spends
+        itself refusing elsewhere.
+        """
+        for offset in table.get(key, ()):
+            if len(body) < offset + 4 or foreign(self.word(body, offset)):
                 return True
         return False
 
@@ -2564,21 +2912,24 @@ class PolicyConnection(Connection):
         if minor not in SHAPE_ALLOWED:
             return self.refuse_extension(major, minor, SHAPE_REPLIES,
                                          "SHAPE request not on the allowlist")
-        if minor in SHAPE_WINDOW_WRITES and len(body) >= 8:
-            if self.is_foreign(self.word(body, 4)):
+        # Each of these tests the body length through names_foreign, so a
+        # request too short to carry the field it is gated on is refused rather
+        # than skipped -- see _names.
+        if minor in SHAPE_WINDOW_WRITES:
+            if self.names_foreign({minor: (4,)}, minor, body):
                 return "silent", "reshapes a foreign window"
-        if minor in SHAPE_SOURCE_DRAWABLES and len(body) >= 16:
+        if minor in SHAPE_SOURCE_DRAWABLES:
             # The source shape is read, not written, so this is the disclosure
             # half of the same request: gate it like CopyArea's source.
-            if self.is_foreign(self.word(body, 12)):
+            if self.names_foreign({minor: (12,)}, minor, body):
                 return "silent", "shape taken from a foreign drawable"
-        if minor in SHAPE_WINDOW_READS and len(body) >= 4:
+        if minor in SHAPE_WINDOW_READS:
+            if self.names_foreign_window({minor: (0,)}, minor, body):
+                return (lambda seq: self.reply(seq)), "foreign window shape"
             # An all-zero reply reads, for each of these, as a coherent "no
             # shape": QueryExtents' bounding-shaped is data byte 0, GetRects'
             # rectangle count is data word 0, InputSelected's enabled is the
             # header's second byte -- self.reply zeroes all of them.
-            if self.is_foreign_window(self.word(body, 0)):
-                return (lambda seq: self.reply(seq)), "foreign window shape"
         if minor == 6 and len(body) >= 4:             # ShapeSelectInput
             # Selecting ShapeNotify on a foreign window watches it reshape;
             # no reply, so a NoOp is answer enough.
@@ -2768,13 +3119,13 @@ class PolicyConnection(Connection):
             # window (offset 8 in both replies) only when it is foreign, so
             # "do I have focus?" still answers truthfully.
             return ("scrub-foreign", ([8], 0)), "foreign focus window"
-        if minor in XI_FOREIGN_WINDOW_READS and len(body) >= 4:
+        if minor in XI_FOREIGN_WINDOW_READS:
             # Reads about the window rather than about the asking client: the
             # event classes selected on it (7), its do-not-propagate list (9),
             # the pointer device of the client owning it (45).  Each reply
             # carries its count or flag in the first data word, so a blank
             # reply reads as an empty, coherent answer rather than an error.
-            if self.is_foreign_window(self.word(body, 0)):
+            if self.names_foreign_window({minor: (0,)}, minor, body):
                 return (lambda seq: self.reply(seq)), \
                     "foreign window's input wiring"
         if minor == 8 and len(body) >= 4:             # XI1 ChangeDeviceDontPropagateList
@@ -2804,6 +3155,12 @@ class PolicyConnection(Connection):
             if self.is_foreign(self.word(body, 0)):
                 return ((lambda seq: self.reply(seq, bytes([1]))),
                         "XInput grab on a foreign window")
+            # The XInput1 spelling of the same grab, bounded the same way:
+            # the keys it would steal are withheld in the event stream.
+            self.keyboard_grabbed = True
+            return "allow", None
+        if minor == 14:                               # XI1 UngrabDevice
+            self.keyboard_grabbed = False
             return "allow", None
         if minor in (15, 17) and len(body) >= 4:      # XI1 GrabDeviceKey/Button
             # A passive device grab of a key or button on a foreign window is
@@ -2825,6 +3182,20 @@ class PolicyConnection(Connection):
                 # reply carries a status byte at offset 8; 1 == AlreadyGrabbed
                 return ((lambda seq: self.reply(seq, bytes([1]))),
                         "XInput grab on a foreign window")
+            # The XInput2 spelling, and the one that matters: a modern
+            # toolkit grabs through XI2, not through GrabKeyboard.  Allowed
+            # like the core one, and bounded the same way -- GTK asks for the
+            # pointer and the keyboard together here, so refusing it stopped
+            # menus opening at all (measured against gedit: no context menu,
+            # where without the proxy one appeared at the pointer).
+            self.keyboard_grabbed = True
+            return "allow", None
+        if minor == 52:                               # XI2 XIUngrabDevice
+            # Cleared on the ungrab as well as set on the grab: a toolkit takes
+            # the keyboard to open a menu and gives it back when the menu
+            # closes, and a flag that only ever went one way would leave an
+            # ordinary application permanently marked as holding the keyboard.
+            self.keyboard_grabbed = False
             return "allow", None
         if minor == 61 and len(body) >= 4:            # XIBarrierReleasePointer
             # num_barriers at offset 0, then twelve-byte entries carrying the
@@ -2972,7 +3343,15 @@ class PolicyConnection(Connection):
             # from one the policy deliberately allowed.
             verdict, reason = "block", "unparsable request"
 
-        self.sentinel(opcode, minor, verdict, reason)
+        # A verdict that ends in a question to the user is logged *after* the
+        # answer, not before it: "ask" is not an outcome, and recording it as
+        # one made the log say `core:ConvertSelection blocked` about a paste
+        # the user had just allowed.  Measured end to end on a nested desktop,
+        # where the clipboard arrived in the filtered application while the
+        # operation log denied that it had.  The log is the record of what the
+        # policy did; it does not get to be wrong about that.
+        if verdict not in ("ask", "ask-owner"):
+            self.sentinel(opcode, minor, verdict, reason)
 
         if verdict == "allow":
             if opcode == 99 and self.enforce:        # ListExtensions
@@ -3053,8 +3432,10 @@ class PolicyConnection(Connection):
             selection = self.atom_name(self.word(body, 4)) or "selection"
             if self.gate.decide(self.conn_token, self.describe(), selection,
                                 "ownership", self.peer_label(), action="own"):
+                self.sentinel(opcode, minor, "allow", "the user allowed it")
                 self.server.sendall(head + body)
                 return
+            self.sentinel(opcode, minor, "silent", GATE_OWNER_REFUSED)
             # Refused: SetSelectionOwner expects no reply, so dropping it
             # leaves the client believing nothing and the real owner in place.
             verdict = "silent"
@@ -3065,8 +3446,10 @@ class PolicyConnection(Connection):
             if self.gate.decide(self.conn_token, self.describe(),
                                 selection, target, self.peer_label()):
                 self.profile.note_allowed_paste(self.describe(), selection)
+                self.sentinel(opcode, minor, "allow", "the user allowed it")
                 self.server.sendall(head + body)
                 return
+            self.sentinel(opcode, minor, "gate", GATE_REFUSED)
             verdict = "gate"
 
         if verdict == "gate":
@@ -3304,6 +3687,31 @@ class PolicyConnection(Connection):
             self.reply_leds.discard(sequence)
             self.listings.discard(sequence)
 
+    def _bound_event_position(self, head):
+        """Blank the global position in a pointer event that proves the pointer
+        is not over the window the event was reported against.
+
+        The event-side twin of bound_pointer_reply, and the answer to a pointer
+        grab: under one, the server reports events for the whole screen against
+        the grab window, so the window-relative coordinates fall outside the
+        window's tracked size exactly when the pointer is somebody else's
+        business.  A window whose size the policy does not know proves nothing,
+        so its events are bounded too -- the same fail-closed default the
+        twelfth pass gave the reply side.
+        """
+        window = self.word(head, 12)
+        state = self.profile.window_state(window)
+        event_x, event_y = struct.unpack_from(self.endian + "hh", head, 24)
+        inside = bool(state) and state[3] \
+            and 0 <= event_x < state[0] and 0 <= event_y < state[1]
+        if inside:
+            return None
+        patched = bytearray(head)
+        struct.pack_into(self.endian + "I", patched, 16, 0)      # child
+        struct.pack_into(self.endian + "hh", patched, 20, 0, 0)  # root x, y
+        struct.pack_into(self.endian + "H", patched, 28, 0)      # modifiers
+        return bytes(patched)
+
     def substitution(self, sequence, head, body):
         with self.lock:
             answer = self.substitutions.pop(sequence, None)
@@ -3365,6 +3773,20 @@ class PolicyConnection(Connection):
                 return None
             self.grant_selection(self.word(head, 12), self.word(head, 24))
             return None
+
+        # --dry-run promises to report what the policy would refuse and refuse
+        # nothing, and the request and reply paths keep that promise -- a
+        # substitution is only registered `if self.enforce`.  This path used to
+        # keep it with a blanket early return here, which was right about the
+        # refusing and wrong about the reporting: skipping the arms altogether
+        # meant a dry run never worked out *which* events it would have
+        # withheld, so the drops the twenty-sixth pass made visible were
+        # visible only in the mode that also performed them.  Now every arm
+        # runs and every decision is logged; the flag is consulted where the
+        # change is made -- withhold() for a refusal, and a guard on each
+        # rewrite below -- so a dry run is still byte-for-byte an unfiltered
+        # one on the wire.  Learning from an event happens either way.
+
         if code == 11:                           # KeymapNotify
             # EV-5.  KeymapNotify carries a 32-byte bitmap of every key
             # physically down -- the same data QueryKeymap returns, which is
@@ -3386,7 +3808,7 @@ class PolicyConnection(Connection):
             # applied to an event.  KeymapNotify is the one core event with
             # neither a window nor a sequence number -- the code byte, then 31
             # bytes of bitmap -- so there is nothing else in it to preserve.
-            return bytes(head[:1]) + b"\0" * 31
+            return (bytes(head[:1]) + b"\0" * 31) if self.enforce else None
 
         xkb_base = self.profile.event_base("XKEYBOARD")
         if xkb_base is not None and code == xkb_base and len(head) >= 2:
@@ -3404,8 +3826,45 @@ class PolicyConnection(Connection):
             # KeymapNotify zeroing is: events are not counted by the client, so
             # dropping one desynchronises nothing.
             if head[1] not in XKB_EVENT_ALLOW:
-                return self.DROP_EVENT
+                return self.withhold("event:XKB%d" % head[1])
             return None
+
+        if code in KEY_EVENT_CODES and not self._focus_is_ours():
+            # The keyboard's delivery rule.  Normally a key event reaches this
+            # client because the server sent it here -- the focus is one of its
+            # windows -- and that is left alone.  A *grab* is the other way to
+            # receive one: while it is held every keystroke in the session
+            # arrives here whatever the user is typing into, which is the
+            # keylogger this project exists to refuse.  Nothing in a KeyPress
+            # distinguishes the two, so the question is asked of the server
+            # instead: while the focus is somebody else's window, a key event
+            # is not this client's to see.
+            return self.withhold(
+                "event:%s" % DROPPABLE_EVENT_NAMES.get(code, code))
+
+        if code in POINTER_EVENT_CODES and len(head) >= 32:
+            # Motion, button and crossing events carry the *global* pointer
+            # position, and a client may grab the pointer on a window of its
+            # own -- after which the server reports every one of them to the
+            # grabbing client, wherever the pointer is.  Measured through the
+            # proxy: with a grab held on a 40x30 window, the pointer moving
+            # across the desktop reported (200,150), (700,500), (1100,800) --
+            # the whole-screen trace the ninth pass bounded QueryPointer for,
+            # the tenth refused crossing events on the root for, and the
+            # twelfth closed the untracked-window default for, arriving by a
+            # fourth road.
+            #
+            # The grab itself is left alone: menus track the pointer with one
+            # and drag-and-drop cannot work without it.  What is bounded is the
+            # *position*, by exactly the test bound_pointer_reply uses on a
+            # reply -- the event's window-relative coordinates against the
+            # window's tracked size.  Inside, the client is entitled to the
+            # position (it could compute it from its own window's origin);
+            # outside -- which is what a grab delivers -- it is somebody else's
+            # business, so the root coordinates, the child window and the
+            # modifier state go blank while the event itself is still
+            # delivered, so the menu still sees the pointer move.
+            return self._bound_event_position(head) if self.enforce else None
 
         if code == 28 and len(head) >= 12:       # PropertyNotify
             # EV-3.  The selection itself stays allowed, because a GTK client
@@ -3422,14 +3881,22 @@ class PolicyConnection(Connection):
             # and not in judge(): the request carries no atom to gate on.
             window, atom = self.word(head, 4), self.word(head, 8)
             if self.is_foreign(window) \
-                    and self.atom_name(atom) not in FOREIGN_PROPERTY_ALLOW \
-                    and not self.granted(self.selection_requestors, window):
+                    and self.atom_name(atom) not in FOREIGN_PROPERTY_ALLOW:
                 # A requestor mid-INCR transfer is the exception: the client
                 # owns the selection, the requestor is somebody else's window,
                 # and PropertyNotify on it is how the owner learns a chunk was
                 # consumed.  Withholding that stalls a transfer the gate has
                 # already approved.
-                return self.DROP_EVENT
+                if not self.granted(self.selection_requestors, window):
+                    return self.withhold("event:PropertyNotify")
+                # ...and this event *is* the far side taking another chunk, so
+                # it is also what keeps the grant alive for the rest of a
+                # transfer longer than SELECTION_GRANT_SECONDS.  Only a
+                # server-generated one counts: a forged PropertyNotify would
+                # let the client renew its own grant, the EV-7 trick the
+                # SelectionRequest arm above refuses for the same reason.
+                if not head[0] & 0x80:
+                    self.renew_selection_grant(window, atom)
             return None
 
         if code == 31 and len(head) >= 24:       # SelectionNotify
@@ -3437,6 +3904,10 @@ class PolicyConnection(Connection):
             # None on the refusal this patch exists to handle, so it cannot be
             # part of the key.  Restore the real selection atom;
             # the property stays None, which is exactly a clean "no owner".
+            # No enforce guard here, unlike the rewrites above: this one undoes
+            # a substitution the *request* path made, and that path registers
+            # one only when enforcing, so under --dry-run there is nothing in
+            # `gated` to match and the arm is inert on its own.
             requestor, target = self.word(head, 8), self.word(head, 16)
             with self.lock:
                 selection = self.gated.pop((requestor, target), None)
@@ -3473,9 +3944,162 @@ class PolicyConnection(Connection):
         allowed = GENERIC_EVENT_ALLOW.get(name)
         passed = allowed == "all" or (allowed is not None and evtype in allowed)
         self.note_generic_event(name, major, evtype, passed)
-        if passed or not self.enforce:
+        if passed:
+            return self._bound_xi_event(name, evtype, head, body)
+        return self.DROP_EVENT if self.enforce else None
+
+    #: XInput2 device events -- key, button, motion and crossing -- share one
+    #: layout: the event window at 24 and the child at 28 in the header, then
+    #: the root position at 32, the window-relative one at 40 (both FP1616,
+    #: whose integer part is the high half) and the modifier set at 56.
+    XI_DEVICE_EVENTS = frozenset({2, 3, 4, 5, 6, 7, 8})
+
+    def _focus_is_ours(self):
+        """True unless the server says another application holds the focus.
+
+        A focus the proxy cannot ask about at all (no upstream connection)
+        answers True: the rule is not meant to make a client deaf when the
+        machinery is missing.  **None is not "ours"**, though, and that
+        distinction was measured rather than reasoned: with `None` treated as
+        ours, exactly one keystroke of a captured word slipped through, and
+        instrumenting the decision showed why -- of twelve evaluations, ten saw
+        the trusted window and two saw a focus of 0.  A window manager reports
+        no focus for a moment while it moves one, and a key arriving in that
+        moment is nobody's -- certainly not a client that only sees it because
+        it holds a grab.  PointerRoot (1) stays "ours": there the keys belong
+        to whatever the pointer is over, which is the case a bare server and a
+        focus-follows-mouse desktop both use.
+
+        Which window a manager focuses is its own business -- openbox and
+        metacity focus the client's own window, measured in the ninth pass --
+        so a manager that focuses a frame of its own would make this drop keys
+        the client should have had, and the log would name it.
+        """
+        window = focus_window(self.endian)
+        if window == 0:
+            # The server says nobody holds the focus.  This has to be spelled
+            # out: is_foreign() reads 0 as "None" and answers False for it
+            # everywhere else, because 0 is how a request says "no window" --
+            # so without this line "nobody is focused" read as "we are".
+            ours = False
+        elif window is None:
+            # The focus could not be read at all: no anchor connection, or one
+            # that has died under us.  Answering "ours" here -- which this did
+            # unconditionally until the twenty-eighth pass -- hands every
+            # keystroke to a client holding a keyboard grab, which is precisely
+            # the keylogger the grab rule exists to stop, reinstated by the
+            # failure of the machinery that stops it.
+            #
+            # Answering "not ours" unconditionally is not the fix either: with
+            # no oracle *every* client goes deaf, including the one the user is
+            # typing into, so a dead anchor would break the whole session.
+            #
+            # The way out is that the two cases are distinguishable. Without a
+            # grab, X delivers a key event only to the focused window's chain,
+            # so a client that is not focused is not being sent keys in the
+            # first place and withholding costs it nothing; *with* a grab, the
+            # server delivers every keystroke to it wherever the user is
+            # typing, and that is the whole attack. So an unreadable focus is
+            # "ours" only for a client that is not holding the keyboard.
+            ours = not self.keyboard_grabbed
+            if not ours:
+                self.profile.note_focus_oracle_lost()
+        else:
+            ours = window == 1 or not self.is_foreign_window(window)
+        return ours
+
+    def _bound_xi_event(self, name, evtype, head, body):
+        """The event-position bound, applied to an XInput2 device event.
+
+        The tenth pass said a generic event cannot be scrubbed field by field
+        because its layout belongs to the extension, and left the channel
+        pass-or-drop.  That is true in general and false for the events that
+        matter here: XI2's device events have one documented shape, which the
+        pointer bound already relies on for XIQueryPointer's *reply*.  Without
+        this, gating the core pointer grab and not this one would have been the
+        same half-measure as gating the core keyboard grab alone: an XI2
+        pointer grab reported the whole desktop -- (200,150), (700,500),
+        (1100,800) -- through events the policy had admitted.
+        """
+        if name != "XInputExtension" or evtype not in self.XI_DEVICE_EVENTS:
             return None
-        return self.DROP_EVENT
+        if evtype in (2, 3) and not self._focus_is_ours():
+            # Named too, and for the same reason: this one is reached with the
+            # evtype already logged as *allowed* by note_generic_event -- it is
+            # in the XGE allowlist -- so without a line here the log positively
+            # asserts that the events it is swallowing got through.
+            return self.withhold(                # XI_KeyPress / XI_KeyRelease
+                "event:XI_Key%s" % ("Press" if evtype == 2 else "Release"))
+        if len(head) < 32 or len(body) < 40:
+            return None
+        window = self.word(head, 24)
+        state = self.profile.window_state(window)
+        event_x, event_y = struct.unpack_from(self.endian + "ii", body, 8)
+        inside = bool(state) and state[3] \
+            and 0 <= event_x >> 16 < state[0] and 0 <= event_y >> 16 < state[1]
+        if inside:
+            return None
+        if not self.enforce:
+            return None
+        patched_head, patched_body = bytearray(head), bytearray(body)
+        struct.pack_into(self.endian + "I", patched_head, 28, 0)   # child
+        struct.pack_into(self.endian + "ii", patched_body, 0, 0, 0)  # root x, y
+        for offset in range(24, 40, 4):                            # modifiers
+            struct.pack_into(self.endian + "I", patched_body, offset, 0)
+        return bytes(patched_head), bytes(patched_body)
+
+    def note_dropped_event(self, label):
+        """Log a withheld fixed event, once per kind on this connection.
+
+        Twenty-sixth pass.  Withholding an event is the policy's most
+        user-visible act -- it is what makes an application hang rather than
+        report an error, because there is no reply for the server to turn into
+        an X error -- and it was the one act the operation log did not record.
+        The generic-event path beside this has named its drops since the tenth
+        pass; the fixed-event path returned DROP_EVENT into a bare `continue`.
+        So the run that first measured the INCR stall finished with the log
+        saying, in as many words, that nothing was blocked, while the proxy was
+        exactly what had stopped the transfer.  An operator reading that log
+        would have no reason to suspect the filter.
+
+        Same once-per-(operation, verdict) shape as sentinel() and
+        note_generic_event, so a stream of withheld key events still costs one
+        line and one set-membership test on the hot path.
+        """
+        seen_key = ("event", label)
+        if seen_key in self.seen:
+            return
+        self.seen.add(seen_key)
+        if self.profile.note_first_seen((label, False), self.describe(),
+                                        self.peer_label(), False,
+                                        "withheld event"):
+            line = ("new operation: %-40s %-8s %s [%s]"
+                    % (label, "blocked", self.describe(), self.peer_label()))
+            if self.alert_new:
+                print(line, file=sys.stderr)
+            self.profile.log_line(line)
+
+    def withhold(self, label):
+        """Refuse an event: report it always, withhold it only when enforcing.
+
+        Twenty-seventh pass.  `--dry-run` exists so an operator can watch an
+        application and read off what enforcing would cost before paying it,
+        and the XGE path says so in as many words -- "in dry-run nothing is
+        enforced, so the event passes; the log still names it, which is the
+        whole point of looking before enforcing".  The fixed-event path made
+        only half of that promise: a blanket early return skipped the arms
+        entirely, so a dry run neither withheld an event nor said it would.
+        The drops the twenty-sixth pass had just made visible were visible only
+        in the mode that also performed them, which is the mode where the
+        application has already broken.
+
+        So the decision is now always taken and always reported, and the enforce
+        flag governs only whether the event is actually withheld -- the same
+        shape the request path has always had, where judge() runs and the
+        substitution is registered `if self.enforce`.
+        """
+        self.note_dropped_event(label)
+        return self.DROP_EVENT if self.enforce else None
 
     def note_generic_event(self, name, major, evtype, passed):
         """Log a generic (XGE) event the first time this connection meets one,
