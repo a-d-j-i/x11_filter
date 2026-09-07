@@ -23,17 +23,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Pinned: an unpinned linter turns somebody else's release into a red
-      # build on a tree nobody touched.  Bump it deliberately.
-      - name: Install ruff
-        run: pipx install ruff==0.16.6
+      # Both pinned.  An unpinned linter turns somebody else's release into a
+      # red build on a tree nobody touched -- and the runner image's shellcheck
+      # did exactly that: 0.10 reports an unused trap handler as SC2317 where
+      # 0.11 reports it as SC2329, so a directive naming one code passed here
+      # and failed there.  Bump these deliberately.
+      - name: Install the linters
+        run: |
+          pipx install ruff==0.16.6
+          pipx install shellcheck-py==0.11.0.1
       - name: Python (bug-class rules; see ruff.toml)
         run: ruff check .
       - name: Shell
-        run: |
-          command -v shellcheck >/dev/null \
-              || sudo apt-get install -y -qq shellcheck
-          shellcheck -s bash *.sh xfilter.bash
+        run: shellcheck -s bash *.sh xfilter.bash
 
   package:
     runs-on: ubuntu-latest
@@ -43,18 +45,21 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-              debhelper dpkg-dev fakeroot lintian
+              build-essential debhelper dpkg-dev fakeroot lintian man-db
       # package.sh runs test_unit.py as the package's own build-time test, so
       # a policy regression fails the build here as well.
       - name: Build the package
         run: ./package.sh
       - name: Lintian
         run: |
-          # initial-upload-closes-no-bugs is suppressed on purpose: it asks
-          # for the ITP bug number, which does not exist until the package is
-          # actually proposed to Debian.  Delete this line the day the
-          # changelog says "Initial release (Closes: #NNNNNN)".
-          lintian --fail-on error,warning \
+          # Errors fail the build; warnings are printed and do not.  The
+          # runner is Ubuntu and its lintian carries tags Debian's does not,
+          # so gating on warnings gates on somebody else's tag set.  Raise
+          # this to error,warning if the package is ever actually proposed.
+          #
+          # initial-upload-closes-no-bugs is suppressed on purpose: it asks for
+          # the ITP bug number, which does not exist until then.
+          lintian --fail-on error \
               --suppress-tags initial-upload-closes-no-bugs \
               build/xfilter_*.changes
       - name: Install it, and check what landed

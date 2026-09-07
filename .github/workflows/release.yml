@@ -34,7 +34,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-              debhelper dpkg-dev fakeroot lintian
+              build-essential debhelper dpkg-dev fakeroot lintian man-db
 
       # A tag that disagrees with debian/changelog would ship a package whose
       # version is not the version people think they downloaded.  Stop here
@@ -55,11 +55,14 @@ jobs:
 
       - name: Lintian
         run: |
-          # initial-upload-closes-no-bugs is suppressed on purpose: it asks
-          # for the ITP bug number, which does not exist until the package is
-          # actually proposed to Debian.  Delete this line the day the
-          # changelog says "Initial release (Closes: #NNNNNN)".
-          lintian --fail-on error,warning \
+          # Errors fail the build; warnings are printed and do not.  The
+          # runner is Ubuntu and its lintian carries tags Debian's does not,
+          # so gating on warnings gates on somebody else's tag set.  Raise
+          # this to error,warning if the package is ever actually proposed.
+          #
+          # initial-upload-closes-no-bugs is suppressed on purpose: it asks for
+          # the ITP bug number, which does not exist until then.
+          lintian --fail-on error \
               --suppress-tags initial-upload-closes-no-bugs \
               build/xfilter_*.changes
 

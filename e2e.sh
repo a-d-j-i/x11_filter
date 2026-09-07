@@ -87,7 +87,7 @@ teardown() {                      # everything one combination started
     rm -f "/tmp/.X11-unix/X${up#:}" "/tmp/.X11-unix/X${px#:}" \
           "/tmp/.X11-unix/X${ax#:}" "/tmp/.X11-unix/X${par#:}"
 }
-# shellcheck disable=SC2329   # invoked by the EXIT trap on the next line
+# shellcheck disable=SC2329,SC2317   # invoked by the EXIT trap on the next line
 cleanup() { teardown; rm -rf "$work"; }
 trap cleanup EXIT
 proxy=""; wm=""; upsrv=""; parent=""; allower=""
