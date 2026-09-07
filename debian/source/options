@@ -1,0 +1,10 @@
+# What does NOT go into the source tarball.
+#
+# Note that giving tar-ignore at all replaces dpkg-source's built-in list
+# rather than adding to it, which is why .git is named here explicitly: drop
+# that line and the repository itself gets shipped.
+tar-ignore = .git
+tar-ignore = .idea
+tar-ignore = e2e.local
+tar-ignore = __pycache__
+tar-ignore = *.py[cod]

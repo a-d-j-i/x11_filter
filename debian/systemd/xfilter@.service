@@ -1,0 +1,30 @@
+# A filter per trust domain, started on demand by systemd --user.
+#
+#     mkdir -p ~/.config/systemd/user
+#     cp /usr/share/doc/xfilter/examples/xfilter@.service ~/.config/systemd/user/
+#     systemctl --user start xfilter@$(systemd-escape work@buildbox)
+#
+# The instance name IS the trust domain: everything behind one filter can
+# read everything else behind it, so run one per account, or per application
+# you do not trust.  The display and the cookie are derived from the name,
+# so nothing has to be passed to the clients -- `xfilter --env NAME` prints
+# the two export lines, and `xfilter --use NAME -- cmd` runs one command
+# against it.
+#
+# `--gate ask` prompts on your real display, so this unit needs a session to
+# draw in; DISPLAY is inherited from the user manager's environment (set it
+# with `systemctl --user import-environment DISPLAY XAUTHORITY`, or give this
+# unit an explicit Environment=DISPLAY=:0), or pass --upstream below.
+
+[Unit]
+Description=Filtering X11 proxy for trust domain %I
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/xfilter --domain %I --gate ask
+Restart=no
+
+[Install]
+WantedBy=graphical-session.target

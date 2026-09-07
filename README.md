@@ -83,7 +83,7 @@ cd x11_filter
 ./xfilter.py --help
 ```
 
-There is no build step and nothing to package: `xfilter.py` and
+There is no build step: `xfilter.py` and
 `xfilter_core.py` are the whole program, so copying those two files out of the
 repository (or out of a release archive) works just as well as cloning. They
 must sit in the same directory — `xfilter.py` imports the other one from
@@ -93,6 +93,20 @@ symlink the file rather than copying it alone:
 ```bash
 ln -s "$PWD/xfilter.py" ~/bin/xfilter.py
 ```
+
+On Debian and its derivatives there is a package, which is that same layout
+made system-wide — the two files in `/usr/share/xfilter`, with `/usr/bin/xfilter`
+and `/usr/bin/xfilter.py` linked to it, and `xfilter.bash` where the shell
+helpers already say to look for it:
+
+```bash
+./package.sh                              # from a clone; builds into build/
+sudo apt install ./build/xfilter_0.9_all.deb
+```
+
+The unit tests run during that build, so a package that installs is a package
+whose policy passed. See `/usr/share/doc/xfilter/README.Debian` afterwards for
+where everything landed.
 
 There is nothing to install with pip — the proxy is Python 3 standard library
 only, and it reads the cookie file and the clipboard itself rather than
@@ -805,6 +819,10 @@ MIT. See `LICENSE`.
 - `e2e.sh` — end-to-end test: real X clients through the enforcing proxy.
 - `attack.sh`, `attack.py` — adversarial test: the attacks the policy claims to
   stop, each run straight at the server and through the proxy.
+- `package.sh` — builds the Debian package into `build/`.
+- `debian/` — the Debian package: it installs the two files side by side in
+  `/usr/share/xfilter` and links `/usr/bin/xfilter` to them, and runs
+  `test_unit.py` as its build-time test.
 - `xfilter_core.py` — the relay: connection setup and cookie swap, request and
   reply parsing, atom and extension bookkeeping, the profile. Also runs
   standalone as a pure profiler (`python3 xfilter_core.py --display :20 …`),

@@ -1,0 +1,59 @@
+xfilter for Debian
+==================
+
+Where the files went
+--------------------
+
+The program is two Python files that must sit in the same directory, so both
+are installed to /usr/share/xfilter and /usr/bin/xfilter is a link to
+xfilter.py there.  /usr/bin/xfilter.py is a second link to the same file,
+because that is the name the README and the shell helpers use.
+
+The shell helpers
+-----------------
+
+xfilter.bash defines `xssh`, which starts a trust domain's filter if it is not
+already up and then sshs through it.  It is not sourced for you -- add this to
+~/.bashrc (or ~/.zshrc):
+
+    . /usr/share/xfilter/xfilter.bash
+
+What is a Recommends, and why
+-----------------------------
+
+openssh-client is a Recommends rather than a Depends.  `--ssh HOST` runs
+`ssh -X -o ForwardX11Trusted=yes HOST`, and the shipped `xssh` helper does the
+same, so almost every install wants it -- but the proxy is equally a wall
+around a *local* application you do not trust (`xfilter -- xterm`,
+`xfilter --use NAME -- cmd`), and that use needs no ssh at all.  There is no
+version bound because there is nothing recent to require: ForwardX11Trusted
+has been an OpenSSH option since 3.8, in 2004.  It is openssh-client by name
+rather than the virtual ssh-client, because that option is OpenSSH's, not
+every ssh client's.  With ssh missing, `--ssh` fails immediately and says so
+("cannot run ssh: ..."), rather than starting a proxy nothing connects to.
+
+The clipboard prompt
+--------------------
+
+`--gate ask` is the setting that gives you a working clipboard in both
+directions.  It needs python3-gi and gir1.2-gtk-3.0, which are Recommends
+rather than Depends: the proxy itself is Python 3 standard library only, and
+`--gate deny` (the default) and `--gate allow` do not draw anything.
+
+It also needs somewhere to draw, which no package can supply.  The prompt
+opens on your real display (--upstream), deliberately not on the filtered one,
+so on a headless machine there is nowhere to put it.
+
+Running one per trust domain under systemd
+------------------------------------------
+
+/usr/share/doc/xfilter/examples/xfilter@.service is a user template unit, one
+instance per domain.  Copy it to ~/.config/systemd/user/ and start an instance:
+
+    systemctl --user start xfilter@$(systemd-escape work@buildbox)
+
+Everything behind one filter can read everything else behind it, so the
+instance name is the security boundary: one per account, or per application
+you do not trust.
+
+ -- Andres Adjimann <aadjiman@gmail.com>, Mon, 07 Sep 2026 10:39:17 -0300

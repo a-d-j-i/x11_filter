@@ -1,0 +1,38 @@
+Source: xfilter
+Section: x11
+Priority: optional
+Maintainer: Andres Adjimann <aadjiman@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               python3
+Standards-Version: 4.7.0
+Homepage: https://github.com/a-d-j-i/x11_filter
+Vcs-Git: https://github.com/a-d-j-i/x11_filter.git
+Vcs-Browser: https://github.com/a-d-j-i/x11_filter
+Rules-Requires-Root: no
+
+Package: xfilter
+Architecture: all
+Depends: python3 (>= 3.9),
+         ${misc:Depends}
+Recommends: openssh-client,
+            python3-gi,
+            gir1.2-gtk-3.0
+Description: policy-enforcing X11 proxy for untrusted clients
+ xfilter sits between an X client and the real X server and puts every
+ request to a default-deny policy before it is forwarded.  A request is
+ passed only if it is on the safe allowlist or a rule decides on it: reads
+ of other clients' data are refused, the handful of foreign reads that
+ theming and window management need are kept, CLIPBOARD and PRIMARY are
+ gated behind a prompt, and anything nobody thought of is blocked and
+ logged rather than passed on trust.
+ .
+ It is meant for the machine with the real X server -- the one you sit at.
+ Nothing is installed on the remote host, which is the point: an X client
+ reached over "ssh -X" with trusted forwarding can otherwise log your
+ keystrokes, read your clipboard and screenshot your desktop, and the
+ remote side gets no say in the filtering.
+ .
+ The proxy is Python 3 standard library only.  It reads the authority
+ cookie and the clipboard itself, so neither xauth nor xclip is needed;
+ python3-gi and the GTK 3 typelib are needed only for the "--gate ask"
+ prompt, which draws on your real display.

@@ -1,0 +1,11 @@
+xfilter (0.9) unstable; urgency=medium
+
+  * Initial Debian package.
+    - the program installs to /usr/share/xfilter, with /usr/bin/xfilter and
+      /usr/bin/xfilter.py as links to it, so xfilter.py keeps finding
+      xfilter_core.py beside itself.
+    - the shell helpers land at /usr/share/xfilter/xfilter.bash, which is
+      the path they already document for a packaged install.
+    - the systemd user template from the README ships as an example.
+
+ -- Andres Adjimann <aadjiman@gmail.com>  Mon, 07 Sep 2026 10:39:17 -0300

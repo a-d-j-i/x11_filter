@@ -14,8 +14,48 @@
 # filter and use it in the same breath.  That is a convenience, and
 # conveniences belong somewhere you can read and change them.
 
-# The command, so this works from a clone as well as from a package.
-: "${XFILTER:=xfilter.py}"
+# The command: a full path, worked out once, here.
+#
+# Not the bare name this used to be.  A shell remembers where it first found a
+# command and keeps using that path without looking again, so when an install
+# moves -- a clone replaced by a package, say -- an old shell goes on trying
+# the path that is no longer there, and the failure names a file nobody typed.
+# Resolving once, at source time, puts the answer somewhere you can read:
+# `echo $XFILTER`.
+#
+# The search walks PATH here rather than asking the shell, because the shell
+# answers out of that same memory: `command -v` will name a file that was
+# deleted an hour ago, which is the problem rather than the fix.
+#
+# Set XFILTER yourself to override.  A name is looked up on PATH, a path is
+# taken as given -- which is how you point these helpers at a clone.
+_xfilter_lookup() {
+    local dir rest
+    case "$1" in
+        */*) [ -x "$1" ] || return 1; printf '%s' "$1"; return 0 ;;
+    esac
+    rest="$PATH"
+    while [ -n "$rest" ]; do
+        dir="${rest%%:*}"
+        [ "$dir" = "$rest" ] && rest="" || rest="${rest#*:}"
+        if [ -x "${dir:-.}/$1" ]; then printf '%s' "${dir:-.}/$1"; return 0; fi
+    done
+    return 1
+}
+
+if [ -n "${XFILTER:-}" ]; then
+    XFILTER="$(_xfilter_lookup "$XFILTER" || printf '%s' "$XFILTER")"
+else
+    XFILTER="$(_xfilter_lookup xfilter.py || _xfilter_lookup xfilter \
+               || printf '%s' xfilter.py)"
+fi
+unset -f _xfilter_lookup          # source-time only; not a name to leave behind
+
+# Nothing was found, or what was named is not there.  Say so at once: the
+# alternative is silence now and a puzzling fifteen-second wait later, for a
+# filter that was never going to start.
+[ -x "$XFILTER" ] || echo "xfilter.bash: no proxy at '$XFILTER' --" \
+    "install xfilter, or set XFILTER to the path of xfilter.py" >&2
 
 # Which display new filters forward *to*, captured once when this file is
 # sourced.  Deliberately not "whatever DISPLAY says at the time": a shell that
@@ -46,6 +86,10 @@
 # display works" are not the same claim.
 _xfilter_up() {
     local domain="${1:?usage: _xfilter_up DOMAIN}" log=""
+    if [ ! -x "$XFILTER" ]; then                  # nothing to start: say so now
+        echo "xssh: no proxy at $XFILTER -- set XFILTER, or install xfilter" >&2
+        return 1
+    fi
     "$XFILTER" --env "$domain" >/dev/null 2>&1 && return 0    # already up
 
     mkdir -p "$XF_LOGDIR" 2>/dev/null

@@ -1,0 +1,10 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+# There is nothing to build: the program is two Python files that are
+# installed as they are.  The tests are pure -- no X server, no network --
+# so they run at build time, where a broken policy is cheapest to notice.
+override_dh_auto_test:
+	python3 test_unit.py

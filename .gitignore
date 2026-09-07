@@ -9,3 +9,12 @@ filter-report.txt
 e2e.local
 
 .idea
+
+# debian packaging build products
+/build/
+debian/.debhelper/
+debian/xfilter/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/*.debhelper.log

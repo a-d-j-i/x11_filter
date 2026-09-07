@@ -1,0 +1,235 @@
+.TH XFILTER 1 "September 2026" "xfilter 0.9" "User Commands"
+.SH NAME
+xfilter \- policy-enforcing X11 proxy for untrusted clients
+.SH SYNOPSIS
+.B xfilter
+.RI [ options ]
+.RB [ \-\- ]
+.RI [ command " ...]"
+.br
+.B xfilter
+.B \-\-ssh
+.I host
+.RB [ \-\- ]
+.RI [ "remote command" " ...]"
+.br
+.B xfilter
+.BR \-\-domain " | " \-\-use " | " \-\-env " | " \-\-stop
+.I name
+.br
+.B xfilter \-\-list
+.SH DESCRIPTION
+.B xfilter
+sits between an X client and the real X server and puts every request to a
+policy before forwarding it.  It runs on the machine with the real X server
+\(em the one you sit at.  Nothing is installed on the remote host, and the
+remote side gets no say in what is filtered.
+.PP
+The policy is default\-deny: a request is passed only if it is on the safe
+allowlist or a rule decides on it.  Reads of other clients' data are refused,
+the handful of foreign reads that theming and window management need are kept,
+CLIPBOARD and PRIMARY are gated, and anything nobody thought of is blocked and
+logged rather than passed on trust.  A refused request is never simply dropped
+\(em the server counts requests to generate sequence numbers \(em so denials
+are substituted with something harmless and the client sees a plausible
+answer rather than a broken stream.
+.PP
+Clients reach the proxy over a display of its own, with a cookie of its own:
+they never hold the cookie for the real server.
+.SH OPTIONS
+.TP
+.BI \-\-display " DISPLAY"
+Display to offer clients.  Default: the first free one from
+.BR :20 .
+.TP
+.BI \-\-ssh " HOST"
+Run
+.B ssh \-X
+to
+.I HOST
+through the proxy; anything after
+.B \-\-
+is the remote command.
+.TP
+.BI \-\-upstream " UPSTREAM"
+The real display to forward to.  Default:
+.BR $DISPLAY .
+The
+.B \-\-gate ask
+prompt opens here too, deliberately not on the filtered display.
+.TP
+.BI \-\-auth " FILE"
+Authority file (xauth format) holding the cookie clients must present to
+.BR \-\-display ;
+created if missing.  Default: a private temporary file, removed on exit.
+.TP
+.BI \-\-upstream\-auth " FILE"
+Authority file holding the cookie for
+.BR \-\-upstream .
+Default:
+.BR $XAUTHORITY ,
+then
+.BR ~/.Xauthority .
+.TP
+.BR \-v ", " \-\-verbose
+Report every connection and its outcome.
+.TP
+.B \-\-dry\-run
+Report what the policy would refuse, refusing nothing.  Without it the policy
+is enforced.
+.TP
+.BI \-\-gate " {deny,allow,ask}"
+What a filtered application may do with CLIPBOARD or PRIMARY \(em both reading
+one and taking ownership of one, which is how it offers a copy out.
+.B deny
+(the default) means copying out of the forwarded application does not work
+either;
+.B allow
+passes both;
+.B ask
+prompts you, showing the value and which application wants it, and is the
+setting that gives you a clipboard in both directions.
+.TP
+.BI \-\-gate\-timeout " S"
+Deny a pending prompt after this long.  Default: 20 seconds.
+.TP
+.BI \-\-gate\-remember " S"
+How long \(lqAllow for a while\(rq lasts.  Default: 300 seconds.
+.TP
+.BI \-\-domain " NAME"
+Run as the filter for this trust domain: the display and the cookie are
+derived from the name, so nothing has to be remembered or passed around.
+Runs in the foreground and lives until it is stopped; if one is already
+running for this name it says so and exits.  Everything behind one filter can
+read everything else behind it, so the name is the security boundary: one per
+account, or per application you do not trust.
+.TP
+.BI \-\-use " NAME"
+Run the command after
+.B \-\-
+against this domain's filtered display; the environment is scoped to that
+command and nothing else.
+.TP
+.BI \-\-env " NAME"
+Print this domain's two export lines on stdout, for
+.B eval
+in a shell script.  Everything else goes to stderr, so the output is safe to
+eval.
+.TP
+.B \-\-list
+List the filtered domains running for you.
+.TP
+.BI \-\-stop " NAME"
+Stop the filter for a domain.
+.TP
+.BI \-\-log " FILE"
+Also append the operation log \(em each new operation, and the exit report \(em
+to
+.IR FILE .
+It always goes to stdout as well.
+.TP
+.B \-\-version
+Show the version and exit.
+.TP
+.BR \-h ", " \-\-help
+Show the option summary and exit.
+.SH EXAMPLES
+An interactive remote shell, where everything launched from it is filtered:
+.PP
+.RS
+.nf
+xfilter \-\-gate ask \-\-ssh remotehost
+.fi
+.RE
+.PP
+One remote application:
+.PP
+.RS
+.nf
+xfilter \-\-gate ask \-\-ssh remotehost \-\- firefox
+.fi
+.RE
+.PP
+A trust domain kept up on its own, then used:
+.PP
+.RS
+.nf
+xfilter \-\-domain work@buildbox \-\-gate ask &
+xfilter \-\-use work@buildbox \-\- ./deploy.sh
+xfilter \-\-list
+xfilter \-\-stop work@buildbox
+.fi
+.RE
+.PP
+Look before you leap: report what the policy would refuse, refusing nothing.
+.PP
+.RS
+.nf
+xfilter \-\-dry\-run \-\-ssh remotehost \-\- some\-application
+.fi
+.RE
+.SH ENVIRONMENT
+.TP
+.B DISPLAY
+The real display forwarded to, unless
+.B \-\-upstream
+says otherwise.
+.TP
+.B XAUTHORITY
+Where the cookie for that display is read from, unless
+.B \-\-upstream\-auth
+says otherwise.
+.SH FILES
+.TP
+.I /usr/share/xfilter/xfilter.py
+The command.
+.B /usr/bin/xfilter
+and
+.B /usr/bin/xfilter.py
+are links to it.
+.TP
+.I /usr/share/xfilter/xfilter_core.py
+The relay it is built on: connection setup and cookie swap, request and reply
+parsing, atom and extension bookkeeping.  It has to sit beside
+.IR xfilter.py .
+It also runs on its own as a pure profiler, which denies nothing:
+.B python3 /usr/share/xfilter/xfilter_core.py \-\-display :20 ...
+.TP
+.I /usr/share/xfilter/xfilter.bash
+Shell helpers defining
+.BR xssh ,
+which starts a domain's filter if needed and then sshs through it.  Source it
+from
+.I ~/.bashrc
+to use it.
+.TP
+.I /usr/share/doc/xfilter/examples/xfilter@.service
+A systemd user template unit, one instance per trust domain.
+.SH NOTES
+.B \-\-gate ask
+needs
+.B python3-gi
+and
+.B gir1.2\-gtk\-3.0
+for the prompt and its preview, and a display to draw them on: the dialog
+opens on
+.BR \-\-upstream ,
+never on the filtered display, since routing it through the proxy would put
+the dialog's own clipboard reads in front of the gate they exist to serve.
+The bindings are checked as the arguments are parsed, so a missing package is
+an immediate error rather than a failure once the proxy is running.
+.PP
+Everything behind one filter can read everything else behind it.  The trust
+boundary is the filter, not the application: run a separate one per account,
+or per application you do not trust.
+.SH SEE ALSO
+.BR ssh (1),
+.BR Xsecurity (7),
+.BR xauth (1).
+.PP
+.I /usr/share/doc/xfilter/README.md.gz
+is the full documentation, and
+.I /usr/share/doc/xfilter/AUDIT.md.gz
+records what the policy has been attacked with and what it stops.
+.SH AUTHOR
+Andres Adjimann <aadjiman@gmail.com>
