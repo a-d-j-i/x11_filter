@@ -1,10 +1,5 @@
-# What does NOT go into the source tarball.
-#
-# Note that giving tar-ignore at all replaces dpkg-source's built-in list
-# rather than adding to it, which is why .git is named here explicitly: drop
-# that line and the repository itself gets shipped.
-tar-ignore = .git
-tar-ignore = .idea
-tar-ignore = e2e.local
-tar-ignore = __pycache__
-tar-ignore = *.py[cod]
+# The build products and the IDE's workspace are not part of the source.
+# Under 3.0 (quilt) that matters because dpkg-source diffs the tree against the
+# orig tarball and calls anything unexpected a local change; package.sh builds
+# from a clean copy, so this is for anyone running dpkg-source by hand.
+extend-diff-ignore = "^(\.idea/|\.github/|build/|__pycache__/|e2e\.local$|.*\.py[cod]$)"

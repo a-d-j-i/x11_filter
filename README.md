@@ -100,8 +100,8 @@ and `/usr/bin/xfilter.py` linked to it, and `xfilter.bash` where the shell
 helpers already say to look for it:
 
 ```bash
-./package.sh                              # from a clone; builds into build/
-sudo apt install ./build/xfilter_0.9_all.deb
+./package.sh                                 # from a clone; builds into build/
+sudo apt install ./build/xfilter_0.9-1_all.deb
 ```
 
 The unit tests run during that build, so a package that installs is a package
@@ -819,7 +819,13 @@ MIT. See `LICENSE`.
 - `e2e.sh` — end-to-end test: real X clients through the enforcing proxy.
 - `attack.sh`, `attack.py` — adversarial test: the attacks the policy claims to
   stop, each run straight at the server and through the proxy.
-- `package.sh` — builds the Debian package into `build/`.
+- `package.sh` — builds the Debian package into `build/`: the upstream tarball
+  first, then the packaging on top of a copy of it, so the build tests what the
+  package actually ships.
+- `ruff.toml` — linter settings. Bug-class rules only; the formatter is
+  deliberately not run.
+- `.github/workflows/` — tests, linters and a real package build on every push;
+  a tagged release builds and attaches the `.deb` and the source package.
 - `debian/` — the Debian package: it installs the two files side by side in
   `/usr/share/xfilter` and links `/usr/bin/xfilter` to them, and runs
   `test_unit.py` as its build-time test.

@@ -1,0 +1,30 @@
+# Bugs, not taste.
+#
+# This is ten thousand lines of deliberately conservative Python -- percent
+# formatting, no f-strings, hand-aligned comments -- and it is security code
+# that has been through thirty audit passes, where a line that has *not*
+# changed is worth something.  So the linter is asked for the rules that find
+# mistakes and nothing that would rewrite working code to a newer taste:
+#
+#   F    pyflakes      -- undefined names, unused imports and variables
+#   E9   syntax        -- the errors that stop the file parsing at all
+#   B    bugbear       -- mutable defaults, loop-variable closures, and friends
+#
+# `ruff format` is deliberately not run and not wired into CI.  Measured on
+# this tree it would rewrite 4,634 of 10,256 lines -- a diff nobody can review,
+# against a codebase whose formatting is a deliberate part of how it reads.
+#
+# (A note on names: ruff is the linter.  Prettier, which does the same job for
+# JavaScript and CSS, has no business here -- its Python equivalent is a
+# formatter, which is the thing above that we are not running.)
+
+# It is not a package; there is nothing to discover but these files.
+include = ["*.py"]
+
+[lint]
+select = ["F", "E9", "B"]
+
+# `raise ... from err` inside an except clause.  Every one of the eight sites
+# is a SystemExit in a command-line error path, where the chained traceback is
+# noise rather than information.
+ignore = ["B904"]

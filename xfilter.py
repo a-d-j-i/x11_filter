@@ -61,7 +61,6 @@ sees a refusal for the selection it actually asked about.
 """
 
 import argparse
-import collections
 import hashlib
 import os
 import queue

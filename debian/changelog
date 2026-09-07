@@ -1,6 +1,9 @@
-xfilter (0.9) unstable; urgency=medium
+xfilter (0.9-1) unstable; urgency=medium
 
   * Initial Debian package.
+    - source format 3.0 (quilt): the orig tarball is the upstream tree without
+      debian/, which .gitattributes keeps out of `git archive` and out of
+      GitHub's generated tarballs too.
     - the program installs to /usr/share/xfilter, with /usr/bin/xfilter and
       /usr/bin/xfilter.py as links to it, so xfilter.py keeps finding
       xfilter_core.py beside itself.

@@ -1,0 +1,70 @@
+# Every push and pull request: the tests, the linters, and a real package
+# build.  Nothing here needs an X server -- the unit tests build request bytes
+# by hand, and e2e.sh/attack.sh need a display, so they stay a local job.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: python3 test_unit.py
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned: an unpinned linter turns somebody else's release into a red
+      # build on a tree nobody touched.  Bump it deliberately.
+      - name: Install ruff
+        run: pipx install ruff==0.16.6
+      - name: Python (bug-class rules; see ruff.toml)
+        run: ruff check .
+      - name: Shell
+        run: |
+          command -v shellcheck >/dev/null \
+              || sudo apt-get install -y -qq shellcheck
+          shellcheck -s bash *.sh xfilter.bash
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              debhelper dpkg-dev fakeroot lintian
+      # package.sh runs test_unit.py as the package's own build-time test, so
+      # a policy regression fails the build here as well.
+      - name: Build the package
+        run: ./package.sh
+      - name: Lintian
+        run: |
+          # initial-upload-closes-no-bugs is suppressed on purpose: it asks
+          # for the ITP bug number, which does not exist until the package is
+          # actually proposed to Debian.  Delete this line the day the
+          # changelog says "Initial release (Closes: #NNNNNN)".
+          lintian --fail-on error,warning \
+              --suppress-tags initial-upload-closes-no-bugs \
+              build/xfilter_*.changes
+      - name: Install it, and check what landed
+        run: |
+          sudo apt-get install -y ./build/xfilter_*_all.deb
+          xfilter --version
+          xfilter.py --version          # the compatibility link
+          test -f /usr/share/xfilter/xfilter_core.py
+          man --warnings -E UTF-8 -l /usr/share/man/man1/xfilter.1.gz >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xfilter-deb
+          path: build/xfilter_*

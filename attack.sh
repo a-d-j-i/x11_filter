@@ -108,6 +108,7 @@ for wanted in "${managers[@]}"; do
         "$([ "$wanted" = openbox ] && echo openbox || echo metacity)"
 done
 
+# shellcheck disable=SC2329   # invoked by the EXIT trap, not by name
 cleanup() {
     for pid in ${proxy_allow:-} ${proxy:-} ${wm:-} ${upsrv:-} ${parent:-}; do
         kill "$pid" 2>/dev/null

@@ -1958,7 +1958,9 @@ def test_screen_references_may_name_a_root_but_not_a_foreign_window():
         def body(drawable):
             raw = bytearray(12)
             struct.pack_into(LE + "I", raw, 0, OWN)
-            struct.pack_into(LE + "I", raw, offset, drawable)
+            struct.pack_into(LE + "I", raw, offset, drawable)  # noqa: B023
+            #  ^ late binding is harmless: body() is only ever called
+            #    inside the iteration that defined it
             return bytes(raw)
         assert conn.judge(opcode, 0, body(ROOT))[0] == "allow", opcode
         assert conn.judge(opcode, 0, body(OWN))[0] == "allow", opcode

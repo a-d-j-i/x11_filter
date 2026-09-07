@@ -1,0 +1,11 @@
+# Keep the packaging and the CI out of `git archive`, and so out of the
+# tarballs GitHub generates for a tag: that archive is the *upstream* release,
+# and under Debian's 3.0 (quilt) format the orig tarball must not carry a
+# debian/ directory of its own.  A clone still has everything.
+debian/     export-ignore
+.github/    export-ignore
+.gitattributes export-ignore
+.gitignore  export-ignore
+.idea/      export-ignore
+.ruff_cache/ export-ignore
+e2e.local   export-ignore

@@ -6,5 +6,11 @@
 # There is nothing to build: the program is two Python files that are
 # installed as they are.  The tests are pure -- no X server, no network --
 # so they run at build time, where a broken policy is cheapest to notice.
+#
+# No nocheck guard: dh omits this whole target under
+# DEB_BUILD_OPTIONS=nocheck and says so ("command-omitted").  Lintian's
+# override_dh_auto_test-does-not-check-DEB_BUILD_OPTIONS is informational and
+# assumes an older shape; add `ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))`
+# around it if a reviewer would rather see the guard than this comment.
 override_dh_auto_test:
 	python3 test_unit.py

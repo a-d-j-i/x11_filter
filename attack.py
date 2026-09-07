@@ -495,7 +495,9 @@ def _keyboard_grab(rig, connect):
     # owner-events in the header's data byte; grab window, time, the two modes
     reply = client.reply(31, struct.pack("<IIBBxx", window, 0, 1, 1))
     granted = bool(reply) and reply[1] == 0                  # 0 == Success
-    keeper = focus_elsewhere(rig)                            # the user is typing there
+    keeper = focus_elsewhere(rig)  # noqa: F841 -- held, not used: dropping
+    #                                the name closes the connection whose
+    #                                window holds the focus we just moved
     rig.type_word("secret")
     keys = [message[1] for kind, message in client.drain(1.0)
             if kind == "event" and message[0] & 0x7F == 2]   # KeyPress
@@ -544,7 +546,9 @@ def _xi_keyboard_grab(rig, connect):
     reply = client.reply(major, struct.pack("<IIIHBBBxHI", window, 0, 0, 3, 1,
                                             1, 0, 1, keys_wanted), minor=51)
     granted = bool(reply) and reply[8] == 0
-    keeper = focus_elsewhere(rig)                            # the user is typing there
+    keeper = focus_elsewhere(rig)  # noqa: F841 -- held, not used: dropping
+    #                                the name closes the connection whose
+    #                                window holds the focus we just moved
     rig.type_word("secret")
     keys = [struct.unpack_from("<I", message, 16)[0]
             for kind, message in client.drain(1.2)

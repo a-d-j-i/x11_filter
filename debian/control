@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: Andres Adjimann <aadjiman@gmail.com>
 Build-Depends: debhelper-compat (= 13),
                python3
-Standards-Version: 4.7.0
+Standards-Version: 4.7.2
 Homepage: https://github.com/a-d-j-i/x11_filter
 Vcs-Git: https://github.com/a-d-j-i/x11_filter.git
 Vcs-Browser: https://github.com/a-d-j-i/x11_filter

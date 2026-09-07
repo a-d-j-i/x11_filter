@@ -87,6 +87,7 @@ teardown() {                      # everything one combination started
     rm -f "/tmp/.X11-unix/X${up#:}" "/tmp/.X11-unix/X${px#:}" \
           "/tmp/.X11-unix/X${ax#:}" "/tmp/.X11-unix/X${par#:}"
 }
+# shellcheck disable=SC2329   # invoked by the EXIT trap on the next line
 cleanup() { teardown; rm -rf "$work"; }
 trap cleanup EXIT
 proxy=""; wm=""; upsrv=""; parent=""; allower=""
@@ -467,6 +468,7 @@ run_combination() {
     # XFILTER_ARGS passes extra policy flags through, so a stricter setting can
     # be tried against the same clients without editing this file:
     #     XFILTER_ARGS='--gate allow' ./e2e.sh
+    # shellcheck disable=SC2086   # XFILTER_ARGS is several flags: it must split
     XAUTHORITY="$up_auth" python3 "$here/xfilter.py" --display "$px" \
         --upstream "$up" --auth "$px_auth" --upstream-auth "$up_auth" \
         --log "$work/ops.log" ${XFILTER_ARGS:-} \
@@ -500,6 +502,7 @@ run_combination() {
         # and handing off to it -- it starts a clean, separate instance
         # instead.  setsid puts it in its own process group so its JVM/helpers
         # tear down as a group.
+        # shellcheck disable=SC2086   # $app is a command line: it must split
         HOME="$home" \
             XDG_CONFIG_HOME="$home/.config" XDG_CACHE_HOME="$home/.cache" \
             XDG_DATA_HOME="$home/.local/share" XDG_STATE_HOME="$home/.local/state" \
