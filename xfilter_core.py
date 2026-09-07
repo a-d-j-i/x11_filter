@@ -61,7 +61,6 @@ import os
 import signal
 import socket
 import struct
-import subprocess
 import sys
 import threading
 
@@ -445,6 +444,66 @@ def connect_upstream(target):
     return sock
 
 
+#: An xauth file is a flat sequence of entries in libXau's format, with no
+#: header and no index: a big-endian family, then four big-endian-counted byte
+#: strings -- address, display number, authorisation name, authorisation data.
+#: Reading and writing it here rather than shelling out to `xauth` keeps the
+#: proxy's runtime requirements to python3 and the X server itself, which
+#: matters because the one thing the proxy must do before anything else works
+#: is find a cookie.
+XAUTH_LOCAL = 256                          # FamilyLocal: address is a hostname
+COOKIE_NAME = b"MIT-MAGIC-COOKIE-1"
+
+
+def read_xauth(path):
+    """Every entry in an xauth file, as (family, address, number, name, data).
+
+    A truncated or corrupt tail yields the entries that did parse rather than
+    raising: half a file may still hold the cookie we need, and a caller that
+    then finds nothing says so with a better message than a struct error.
+    """
+    try:
+        with open(path, "rb") as handle:
+            blob = handle.read()
+    except OSError:
+        return []
+    entries, at = [], 0
+    while at + 2 <= len(blob):
+        family = struct.unpack_from(">H", blob, at)[0]
+        at += 2
+        fields = []
+        for _ in range(4):
+            if at + 2 > len(blob):
+                return entries
+            size = struct.unpack_from(">H", blob, at)[0]
+            at += 2
+            if at + size > len(blob):
+                return entries
+            fields.append(blob[at:at + size])
+            at += size
+        entries.append((family,) + tuple(fields))
+    return entries
+
+
+def write_xauth_entry(path, number, name, data):
+    """Append one entry for display :`number` to an xauth file.
+
+    Written as FamilyLocal with this machine's hostname, which is what
+    `xauth add :N` writes and what libXau looks for when a client connects
+    over the unix socket.  The file is created 0600 if it is not there: it
+    holds the credential for the display the filtered clients use.
+    """
+    address = socket.gethostname().encode()
+    entry = struct.pack(">H", XAUTH_LOCAL)
+    for field in (address, str(number).encode(), name, data):
+        entry += struct.pack(">H", len(field)) + field
+    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(handle, entry)
+    finally:
+        os.close(handle)
+
+
 def cookies_for(xauthority, display, create=False):
     """Pull the MIT-MAGIC-COOKIE-1 for a display out of an xauth file.
 
@@ -453,54 +512,39 @@ def cookies_for(xauthority, display, create=False):
     hand is the single fiddliest part of running this thing.
     """
     number = display.rpartition(":")[2].split(".")[0]
-    env = dict(os.environ)
-    path = os.path.expanduser(xauthority) if xauthority else None
-    if path:
-        env["XAUTHORITY"] = path
+    path = (os.path.expanduser(xauthority) if xauthority
+            else os.environ.get("XAUTHORITY")
+            or os.path.expanduser("~/.Xauthority"))
 
-    def entries():
-        try:
-            return subprocess.run(["xauth", "list"], env=env, check=False,
-                                  capture_output=True, text=True).stdout
-        except FileNotFoundError as exc:
-            raise SystemExit("xauth is not installed: %s" % exc)
-
-    def find(out):
+    def find():
         """Every cookie for this display, in file order.
 
         A display often has more than one entry -- one per address family,
         or a stale one left by an earlier session -- and they need not
         share a value.  Callers that can test a cookie should try them
-        all rather than trust the first.
+        all rather than trust the first.  The address is deliberately not
+        matched: a cookie filed under another hostname is still worth
+        offering to the server, which is the judge of it.
         """
-        found = []
-        for line in out.splitlines():
-            fields = line.split()
-            if len(fields) == 3 and fields[1] == "MIT-MAGIC-COOKIE-1" \
-                    and fields[0].rpartition(":")[2] == number:
-                found.append((b"MIT-MAGIC-COOKIE-1",
-                              bytes.fromhex(fields[2])))
-        return found or None
+        wanted = number.encode()
+        return [(name, data)
+                for _, _, entry_number, name, data in read_xauth(path)
+                if name == COOKIE_NAME and entry_number == wanted]
 
-    found = find(entries())
+    found = find()
     if found:
         return found
 
-    if create and path:
-        if not os.path.exists(path):
-            open(path, "ab").close()
-            os.chmod(path, 0o600)
-        subprocess.run(["xauth", "-f", path, "add", ":" + number,
-                        "MIT-MAGIC-COOKIE-1", os.urandom(16).hex()],
-                       env=env, check=False, capture_output=True)
-        found = find(entries())
+    if create and xauthority:
+        write_xauth_entry(path, number, COOKIE_NAME, os.urandom(16))
+        found = find()
         if found:
             print("created a cookie for :%s in %s" % (number, path),
                   file=sys.stderr)
             return found
 
     raise SystemExit("no MIT-MAGIC-COOKIE-1 for display :%s in %s"
-                     % (number, path or "~/.Xauthority"))
+                     % (number, path))
 
 
 def cookie_for(xauthority, display, create=False):
@@ -570,8 +614,8 @@ def working_cookie(target, candidates):
     tried = ", ".join(sorted({path for path, _ in candidates})) or "no files"
     raise SystemExit(
         "the upstream X server refused every cookie found (%s).\n"
-        "Check that --upstream names your real display and that xauth has "
-        "a current cookie for it: xauth list" % tried)
+        "Check that --upstream names your real display, and that one of "
+        "those files holds a current cookie for it." % tried)
 
 
 class Connection(threading.Thread):
@@ -991,10 +1035,10 @@ def main():
     parser.add_argument("--upstream", default=os.environ.get("DISPLAY", ":0"),
                         help="real display to forward to (default $DISPLAY)")
     parser.add_argument("--auth", metavar="XAUTHORITY",
-                        help="xauth file holding the cookie clients must "
+                        help="authority file (xauth format) holding the cookie clients must "
                              "present for --display; omit to accept any")
     parser.add_argument("--upstream-auth", metavar="XAUTHORITY",
-                        help="xauth file holding the cookie for --upstream "
+                        help="authority file holding the cookie for --upstream "
                              "(default: $XAUTHORITY, then ~/.Xauthority)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="report every connection and its outcome")

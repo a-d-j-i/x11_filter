@@ -42,8 +42,10 @@
 # is only a canvas, and the nested server still hands its clients the full
 # Xorg extension set.
 #
-# Needs Xvfb, xdotool, xauth, and (for the fullscreen checks) openbox or
-# metacity.  The older ATTACK_* spellings still work.
+# Needs python3, xauth, xdotool, xdpyinfo and Xvfb (or Xephyr), plus -- for the
+# fullscreen checks -- openbox or metacity; each is checked up front with what
+# it is for.  xsetroot is optional, and what it costs is printed when it is
+# missing.  The older ATTACK_* spellings still work.
 set -u
 
 mode=""
@@ -72,8 +74,26 @@ par=":69"                              # a canvas for Xephyr, when nothing else
 up=":66"; px=":67"; allow=":68"        # upstream, enforcing proxy, --gate allow
 up_auth="$work/up.auth"; px_auth="$work/px.auth"; allow_auth="$work/allow.auth"
 
-need() { command -v "$1" >/dev/null || { echo "SKIP: $1 not installed"; exit 0; }; }
-need xauth; need xdotool
+# Every tool the suite leans on, checked before a server is started and named
+# with what it is for.  A check that could not be mounted is not a check that
+# passed, so the ones that only cost a single attack say so and let the run
+# continue rather than exiting on it.
+need() {
+    command -v "$1" >/dev/null && return 0
+    echo "SKIP: $1 is not installed -- $2"
+    [ -n "${3:-}" ] && echo "      Debian/Ubuntu: apt install $3"
+    exit 0
+}
+optional() {
+    command -v "$1" >/dev/null && return 0
+    echo "note: $1 is not installed -- $2"
+    [ -n "${3:-}" ] && echo "      Debian/Ubuntu: apt install $3"
+    return 1
+}
+need python3  "the attacks and the proxy they are aimed at are both Python" python3
+need xauth    "the servers under attack are cookie-protected, and this writes their cookie files" xauth
+need xdotool  "the attacks that need real input -- typing a secret, moving the pointer -- drive it at the server" xdotool
+need xdpyinfo "the rig waits for each server to come up by asking it to describe itself" x11-utils
 for wanted in "${servers[@]}"; do
     [ "$wanted" = xephyr ] && need Xephyr
     # Xephyr draws into a window, so with no parent display it needs an Xvfb to
@@ -81,8 +101,11 @@ for wanted in "${servers[@]}"; do
     { [ "$wanted" = xvfb ] || [ -z "$parent_wanted" ]; } && need Xvfb
 done
 for wanted in "${managers[@]}"; do
-    [ "$wanted" = none ] || command -v "$wanted" >/dev/null || {
-        echo "SKIP: $wanted not installed"; exit 0; }
+    [ "$wanted" = none ] || need "$wanted" \
+        "RIG_WM asked for it, and \"did this window go fullscreen?\" is a
+      question only a window manager can answer. Set RIG_WM=none to run
+      without one, knowing the fullscreen checks are then INCONCLUSIVE" \
+        "$([ "$wanted" = openbox ] && echo openbox || echo metacity)"
 done
 
 cleanup() {
@@ -192,7 +215,11 @@ run_against() {                    # server, window manager
     # a window's contents underneath its children are undefined, so a marker
     # window would make the copy read back blank and the check would accuse the
     # policy wrongly.  After the window manager, which paints the root itself.
-    command -v xsetroot >/dev/null && \
+    optional xsetroot \
+        "the root window is left unpainted, so a capture attack may read back
+      a uniform screen; its direct control then proves nothing and the check
+      reports INCONCLUSIVE rather than red" \
+        x11-xserver-utils && \
         DISPLAY=$up XAUTHORITY=$up_auth xsetroot -mod 4 4 -fg white -bg navy
 
     : > "$work/ops.log"

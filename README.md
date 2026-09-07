@@ -73,31 +73,52 @@ implements the policy the extension does not.
 
 ## Install
 
-The proxy runs on the machine with the real X server. Nothing is installed on
-the remote host.
+The proxy runs on the machine with the real X server — the one you sit at.
+**Nothing is installed on the remote host**, which is the point: the remote
+side needs no cooperation, and gets no say.
 
 ```bash
-scp remote:/path/xfilter.py remote:/path/xfilter_core.py ~/bin/
-chmod +x ~/bin/xfilter.py
+git clone https://github.com/a-d-j-i/x11_filter.git
+cd x11_filter
+./xfilter.py --help
 ```
 
-Both files must sit in the same directory; only `xfilter.py` is a command.
-
-There is nothing to install with pip — the proxy is Python 3 standard library
-only. It shells out to two system tools, and the prompt needs one more:
+There is no build step and nothing to package: `xfilter.py` and
+`xfilter_core.py` are the whole program, so copying those two files out of the
+repository (or out of a release archive) works just as well as cloning. They
+must sit in the same directory — `xfilter.py` imports the other one from
+beside itself — and only `xfilter.py` is a command. To have it on your `PATH`,
+symlink the file rather than copying it alone:
 
 ```bash
-sudo apt install xauth xclip        # xauth: cookies;  xclip: the prompt's preview
-sudo apt install python3-gi gir1.2-gtk-3.0    # only for --gate ask
+ln -s "$PWD/xfilter.py" ~/bin/xfilter.py
+```
+
+There is nothing to install with pip — the proxy is Python 3 standard library
+only, and it reads the cookie file and the clipboard itself rather than
+shelling out, so neither `xauth` nor `xclip` has to be installed. One package
+matters, and only for `--gate ask`:
+
+```bash
+sudo apt install python3-gi gir1.2-gtk-3.0    # the prompt, and its preview
 ```
 
 `--gate ask` also needs somewhere to *show* the prompt, which is the part a
 package cannot supply: the dialog opens on your real display (`--upstream`),
 deliberately not on the filtered one, since routing it through the proxy would
-put the dialog's own clipboard reads in front of the gate it exists to serve.
+put the dialog's own clipboard reads in front of the gate it exists to serve —
+and the preview it shows you *is* such a read, taken over that connection.
 On a headless machine there is nowhere to draw it, whatever is installed. The
 bindings are checked as soon as the arguments are parsed, so a missing package
 is an immediate error rather than a failure after the proxy is already running.
+
+The prompt puts itself in front and keeps itself there: it asks the window
+manager for keep-above, urgency and every-desktop, presents itself with a
+server timestamp so focus-stealing prevention does not leave it buried, and
+raises itself at the X level twice a second — which is the part that matters
+inside a bare `Xephyr`, where there is no window manager to honour any of the
+hints. A prompt that a client can bury is a decision that gets made by the
+countdown instead of by you.
 
 ## Use
 
@@ -119,6 +140,152 @@ the command exits — or on Ctrl-C — it prints a report and cleans up.
 To drive it by hand instead, start it without a command and use the two export
 lines it prints.
 
+### One filter, or several?
+
+Each proxy is **one trust domain**: everything connected to the same filtered
+display can read and write everything else on it, because the proxy cannot tell
+two of its own clients apart (over a single tunnel they do not even differ by
+pid). So the question is not how many ssh connections you have, it is where you
+want the walls:
+
+```bash
+# a wall per remote account: the usual shape
+xfilter.py --gate ask --display :77 --auth ~/.xfilter-77.auth --upstream :0
+
+# a wall around one suspect application, whatever else is running
+xfilter.py --gate ask --ssh remotehost -- some-untrusted-app
+```
+
+A **long-lived filter** that many shells attach to wants a fixed display and a
+fixed cookie file: name both, and the cookie is created on the first run and
+**reused** afterwards, so an `export DISPLAY=:77 XAUTHORITY=~/.xfilter-77.auth`
+in your shell profile keeps working across restarts. (Delete that file and the
+next run mints a new cookie, which is what invalidates the shells still holding
+the old one.) Without `--auth` the cookie is per-run and disposable — right for
+`--ssh` and `-- command`, where the proxy hands the environment straight to the
+process it spawns and takes it away on exit.
+
+### Automating it
+
+Two commands, kept apart because they are two different jobs.
+
+**Starting** happens once per domain. It is an ordinary foreground run under a
+name — the display and the cookie are *derived* from that name, so there is
+nothing to remember or pass around — and it lives until you stop it:
+
+```bash
+xfilter.py --domain work@buildbox --gate ask     # a terminal, or a systemd unit
+```
+
+It is **idempotent**: run it again and it prints *"already filtered on :61"* and
+exits, so a login script or a systemd user unit can run it every time without
+ever producing a second trust domain wearing the same name.
+
+**Using** happens constantly and decides nothing — it looks up where the name
+lives and puts that in front of one command:
+
+```bash
+xfilter.py --use work@buildbox -- ssh -X work@buildbox
+xfilter.py --list
+xfilter.py --stop work@buildbox
+```
+
+Backgrounding it is not the proxy's business — `&` is something shells already
+do. `xfilter.bash` in this repository is where that, and the combining of the
+two verbs, live: they are conveniences, and conveniences belong somewhere you
+can read and edit. Source it from your shell profile:
+
+```bash
+. ~/src/x11_filter/xfilter.bash     # or /usr/share/xfilter/xfilter.bash
+
+xssh work@buildbox                  # start the filter if needed, then ssh
+```
+
+One command, not a family of them: `--list`, `--stop` and `--use` are already
+short and say what they do, and a wrapper that saves six characters costs a
+name you have to remember. What `xssh` adds is the one thing the proxy will not
+do for you — start a filter and use it in the same breath.
+
+`xssh` scopes the environment to that one ssh and leaves your shell's `DISPLAY`
+alone. That is deliberate, and it is why there is no `xfuse` that exports a
+domain into your shell: the export would still be there an hour later, when you
+have forgotten about it, and the next thing you started in that shell would
+silently join a trust domain it has nothing to do with.
+
+Because the display is derived rather than recorded, two domains whose names
+happen to point at the same number do not merge: reuse requires that whatever is
+answering there accept **this domain's** cookie, and one that does not is
+stepped over. Sharing a filter is sharing everything behind it, so a silent
+merge is the one outcome that must be impossible.
+
+Under systemd the start side is a template unit away — which is why it takes a
+name and runs in the foreground:
+
+```ini
+# ~/.config/systemd/user/xfilter@.service
+[Service]
+ExecStart=/usr/bin/xfilter --domain %I --gate ask
+```
+
+```bash
+systemctl --user start xfilter@$(systemd-escape work@buildbox)
+```
+
+### In a shell script
+
+Three shapes, in the order you should reach for them.
+
+**Wrap the whole script.** Nothing to remember and nothing to clean up: the
+script and everything it starts inherit the filtered display.
+
+```bash
+xfilter.py --use build -- ./deploy.sh
+```
+
+**Wrap each command.** For a script that only occasionally needs the filtered
+display; each call costs one interpreter start and nothing else.
+
+```bash
+xfilter.py --use build -- ssh -X work@buildbox make check
+xfilter.py --use build -- ssh -X work@buildbox ./run-gui-tests
+```
+
+**Take the environment once**, when everything after a point in the script
+belongs to one domain. `--env` writes the two export lines to stdout —
+everything else goes to stderr, so the output is safe to `eval`:
+
+```bash
+#!/bin/bash
+set -e
+eval "$(xfilter.py --env build)"
+
+ssh -X work@buildbox ./one-gui-thing     # both go through the filtered
+ssh -X work@buildbox ./another           # display, on one filter
+```
+
+The rule that comes with `eval` is the one `xssh` avoids by scoping: everything
+in the scope you eval into now belongs to that domain, so a script that talks to
+**two** hosts uses two `--use` calls rather than one `eval`.
+
+Two more things when scripting. The domain name **is** the security boundary, so
+build it from the identity you are separating — the ssh target, the project, the
+untrusted tool — and never from something incidental like `$$`, or every run
+gets its own filter and the sharing does nothing. And `--gate ask` needs somebody
+at the screen: a script that runs unattended wants `--gate deny` (nothing to
+answer) or `--gate allow` (nothing asked), because the prompt denies on its
+countdown when nobody is there.
+
+Splitting one remote account across several proxies buys less than it looks
+like. It does separate the *X* side — a client behind one proxy cannot name a
+window behind another — but an attacker who can run code on the remote host as
+your user is past that wall already: your `~/.Xauthority` there holds a cookie
+for every forwarded display of that session, all of them readable by the same
+uid, and same-uid processes can inspect each other besides. Extra proxies for
+one account therefore defend against an application that *misbehaves within X*
+— an IDE reading a neighbour's window — and not against a compromised account.
+Draw the wall where the trust actually changes: per host, per account, or
+around one application you do not trust.
+
 | flag | effect |
 | --- | --- |
 | `--gate deny` | refuse clipboard reads silently (default) |
@@ -126,6 +293,13 @@ lines it prints.
 | `--gate allow` | let clipboard reads through |
 | `--dry-run` | report what the policy *would* do, blocking nothing — use it to measure a new application first |
 | `--ssh HOST` | shorthand for `ssh -X -o ForwardX11Trusted=yes HOST` |
+| `--domain NAME` | **start**: run as the filter for this trust domain, display and cookie derived from the name; idempotent, lives until stopped |
+| `--use NAME -- cmd` | **use**: run one command against that domain's display |
+| `--env NAME` | print that domain's two export lines on stdout, for `eval` in a script |
+| `--list` / `--stop NAME` | what is running; stop one |
+| `--version` | the version, for a bug report |
+| `--gate-timeout S` | how long a prompt waits before denying on its own (20s) — walk away and the answer is no |
+| `--gate-remember S` | how long *Allow for a while* holds, for that connection (300s) |
 | `--log FILE` | also append the operation log (each new operation, and the exit report) to `FILE` |
 | `-v` | log every connection and its outcome |
 
@@ -563,7 +737,7 @@ run stays unattended; the parent is only a canvas, and the nested server still
 offers its clients the full extension set either way. (`e2e.sh` also still
 accepts its older `E2E_*` names.)
 
-The **unit** tests (129) build request bytes by hand and ask `judge()` what it
+The **unit** tests (144) build request bytes by hand and ask `judge()` what it
 thinks — no X server, no network, no GUI — which is where a wrong answer is a
 security hole rather than a crash. They cover the parts that must not drift: the
 BIG-REQUESTS framing that keeps a request from being smuggled past the policy,
@@ -575,8 +749,10 @@ window, the fail-closed handling of a request the policy cannot parse, the root-
 exception that keeps menus and drag-and-drop working while foreign windows stay
 opaque, the per-connection keying of the prompt, the polling
 keyloggers (`QueryKeymap`) and trackers (`QueryPointer`), the pointer-mask
-scrub, the identity parsing behind the operation log, and the default-deny
-fall-through.
+scrub, the identity parsing behind the operation log, the authority-file parsing the
+proxy does itself (pinned against a byte string the real `xauth` wrote), the
+the domain naming that decides whether two names can become one filter, and the
+default-deny fall-through.
 
 The **e2e** test stands up a throwaway server and window manager, runs the
 enforcing proxy in front, launches a set of X clients through it
@@ -608,7 +784,14 @@ field that resolves to a NULL pointer inside Xlib, say, which is a real bug
 this test once scored as a pass. Exit status distinguishes the two things that
 can go wrong: `1` means the policy broke a client, `2` means the rig itself
 would not start and the run says nothing about the policy. Needs `xwininfo`,
-`xauth` and `Xvfb` or `Xephyr`; skips absent apps.
+`xauth`, `xdotool`, `xwd` and `Xvfb` or `Xephyr`, plus `xclip` for the clipboard
+checks, which are skipped without it; absent apps are skipped too.
+
+The harnesses use `xauth` and `xclip` as *rigging* — to build a cookie file for
+a throwaway display, and to put something on its clipboard for the proxy to be
+asked about. The proxy itself needs neither; that asymmetry is deliberate, since
+a test that used the proxy's own code to set up its input would be checking that
+code against itself.
 
 ## License
 
@@ -617,6 +800,7 @@ MIT. See `LICENSE`.
 ## Files
 
 - `xfilter.py` — the command: policy, gate, spawning, reporting.
+- `xfilter.bash` — the `xssh` shell function; source it from your profile.
 - `test_unit.py` — the policy and parsing tests.
 - `e2e.sh` — end-to-end test: real X clients through the enforcing proxy.
 - `attack.sh`, `attack.py` — adversarial test: the attacks the policy claims to

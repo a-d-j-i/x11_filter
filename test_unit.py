@@ -7,6 +7,7 @@ quietly -- an offset off by four, or an allowlist entry lost in an edit --
 and where a wrong answer is a security hole rather than a crash.
 """
 
+import os
 import socket
 import struct
 import threading
@@ -179,7 +180,7 @@ def test_extension_list_is_filtered():
 # -- the gate's flood control ----------------------------------------------
 
 def test_denial_is_remembered_and_duplicates_collapse():
-    gate = xfilter.Gate(":0", "/dev/null", timeout=0, remember=300)
+    gate = xfilter.Gate(timeout=0, remember=300)
     prompts = []
 
     def answer_once():
@@ -197,7 +198,7 @@ def test_denial_is_remembered_and_duplicates_collapse():
 
 
 def test_pending_prompts_are_capped():
-    gate = xfilter.Gate(":0", "/dev/null", timeout=0, remember=300)
+    gate = xfilter.Gate(timeout=0, remember=300)
     for n in range(gate.MAX_PENDING):
         gate.requests.put((str(n), "CLIPBOARD", "STRING", "peer", "read", {},
                            threading.Event()))
@@ -208,7 +209,7 @@ def test_pending_prompts_are_capped():
 def test_grant_is_not_inherited_by_a_second_connection():
     # A grant remembered for one connection token must not cover another,
     # even if the second claims the same name.
-    gate = xfilter.Gate(":0", "/dev/null", timeout=0, remember=300)
+    gate = xfilter.Gate(timeout=0, remember=300)
     gate.decisions[(1, "CLIPBOARD", "read")] = (True, time.time() + 300)
     assert gate.decide(1, "app", "CLIPBOARD", "STRING", "peer") is True
     prompts = []
@@ -943,7 +944,7 @@ def test_taking_a_selection_is_gated_like_reading_one():
 
 
 def test_a_read_grant_is_not_an_ownership_grant():
-    gate = xfilter.Gate(":0", "/dev/null", timeout=0, remember=300)
+    gate = xfilter.Gate(timeout=0, remember=300)
     gate.decisions[(1, "CLIPBOARD", "read")] = (True, time.time() + 300)
     assert gate.decide(1, "app", "CLIPBOARD", "STRING", "peer") is True
     asked = []
@@ -3128,6 +3129,174 @@ def test_xinput_query_pointer_is_bounded_too():
     assert struct.unpack_from(LE + "i", gone, 16)[0] == 0, "outside: root_x blanked"
     assert struct.unpack_from(LE + "i", gone, 24)[0] == 0, "win_x blanked"
     assert gone[32] == 0, "same_screen blanked"
+
+# --- the xauth file, which the proxy now reads and writes itself ------------
+#
+# Captured from the real `xauth -f FILE add :77 MIT-MAGIC-COOKIE-1 <hex>`, so
+# these tests pin our parser against the format the tool actually writes
+# rather than against our own writer agreeing with itself.  That matters more
+# than usual here: an X server reads this file to decide who may connect, and
+# libXau in every client reads it to decide what to offer.
+XAUTH_FROM_THE_REAL_TOOL = (
+    b"\x01\x00"                                     # family 256, FamilyLocal
+    b"\x00\x08poderosa"                             # address: the hostname
+    b"\x00\x0277"                                   # display number
+    b"\x00\x12MIT-MAGIC-COOKIE-1"                   # authorisation name
+    b"\x00\x10" + bytes.fromhex("04b05096835285eff300cc44eee84be6"))
+
+
+def _temp_auth(contents=b""):
+    import tempfile
+    handle, path = tempfile.mkstemp(prefix="xfilter-test-auth-")
+    with open(handle, "wb") as out:
+        out.write(contents)
+    return path
+
+
+def test_xauth_reads_what_the_real_tool_writes():
+    path = _temp_auth(XAUTH_FROM_THE_REAL_TOOL)
+    try:
+        entries = core.read_xauth(path)
+        assert len(entries) == 1, entries
+        family, address, number, name, data = entries[0]
+        assert family == core.XAUTH_LOCAL, family
+        assert address == b"poderosa" and number == b"77", entries[0]
+        assert name == core.COOKIE_NAME and len(data) == 16, entries[0]
+        assert core.cookies_for(path, ":77") == [(core.COOKIE_NAME, data)]
+    finally:
+        import os; os.unlink(path)
+
+
+def test_xauth_write_round_trips_and_appends():
+    import os
+    path = _temp_auth(XAUTH_FROM_THE_REAL_TOOL)
+    try:
+        made = core.cookies_for(path, ":88", create=True)
+        assert len(made) == 1 and len(made[0][1]) == 16, made
+        # the entry that was already there is still there: the file is
+        # appended to, not rewritten, because it holds other displays' keys
+        assert core.cookies_for(path, ":77")[0][1] == \
+            XAUTH_FROM_THE_REAL_TOOL[-16:], "existing entry lost"
+        assert core.cookies_for(path, ":88") == made, "not read back"
+        assert [e[2] for e in core.read_xauth(path)] == [b"77", b"88"]
+    finally:
+        os.unlink(path)
+
+
+def test_xauth_created_file_is_private():
+    import os
+    path = _temp_auth()
+    os.unlink(path)                      # cookies_for must create it itself
+    try:
+        core.cookies_for(path, ":88", create=True)
+        assert os.stat(path).st_mode & 0o777 == 0o600, "cookie file is readable"
+    finally:
+        os.unlink(path)
+
+
+def test_xauth_returns_every_cookie_for_the_display():
+    """One display often has several entries, and they need not agree.
+
+    Returning them all is what lets working_cookie try each against the real
+    server instead of trusting the first, which is how a stale entry left by
+    an earlier session stops being fatal.
+    """
+    import os
+    def entry(number, name, data):
+        out = struct.pack(">H", core.XAUTH_LOCAL)
+        for field in (b"host", number, name, data):
+            out += struct.pack(">H", len(field)) + field
+        return out
+    path = _temp_auth(entry(b"20", core.COOKIE_NAME, b"A" * 16)
+                      + entry(b"20", b"XDM-AUTHORIZATION-1", b"B" * 16)
+                      + entry(b"21", core.COOKIE_NAME, b"C" * 16)
+                      + entry(b"20", core.COOKIE_NAME, b"D" * 16))
+    try:
+        assert core.cookies_for(path, ":20") == [(core.COOKIE_NAME, b"A" * 16),
+                                                 (core.COOKIE_NAME, b"D" * 16)]
+        assert core.cookies_for(path, ":20.0") == core.cookies_for(path, ":20")
+        assert core.cookies_for(path, ":21") == [(core.COOKIE_NAME, b"C" * 16)]
+    finally:
+        os.unlink(path)
+
+
+def test_xauth_truncated_tail_keeps_what_parsed():
+    """Half a file may still hold the cookie we need, so a short tail is not
+    an exception -- and a caller that then finds nothing says so plainly."""
+    import os
+    path = _temp_auth(XAUTH_FROM_THE_REAL_TOOL + b"\x01\x00\x00\x08pod")
+    try:
+        assert len(core.read_xauth(path)) == 1, "truncated tail not dropped"
+        assert core.cookies_for(path, ":77"), "good entry lost with the tail"
+    finally:
+        os.unlink(path)
+
+
+def test_xauth_missing_entry_is_fatal_and_creates_nothing():
+    import os
+    path = _temp_auth()
+    os.unlink(path)
+    try:
+        core.cookies_for(path, ":99")
+    except SystemExit as exc:
+        assert "no MIT-MAGIC-COOKIE-1" in str(exc), exc
+    else:
+        raise AssertionError("a missing cookie was not fatal")
+    assert not os.path.exists(path), "created a file without create=True"
+
+
+# --- trust domains -----------------------------------------------------------
+#
+# What these pin is the naming, which is the part that decides whether two
+# domains can end up as one proxy. Whether a *running* proxy is found and
+# reused is settled by a real handshake, so it is proved in e2e.sh, where
+# there is a real proxy to find.
+
+
+def test_domain_names_that_sanitise_alike_stay_apart():
+    """Two domains must never land on one set of files.
+
+    `me@host` and `me/host` reduce to the same safe name, and one set of
+    files would mean one cookie, one display and therefore one trust domain
+    holding two things that were meant to be separate.
+    """
+    assert xfilter.domain_key("me@host") != xfilter.domain_key("me/host")
+    assert xfilter.domain_key("me@host") == xfilter.domain_key("me@host"), \
+        "the same name gave two different keys"
+    assert xfilter.domain_auth("me@host") != xfilter.domain_auth("me/host")
+
+
+def test_domain_name_cannot_escape_its_directory():
+    """The name comes from a command line and becomes a filename."""
+    root = xfilter.domain_root()
+    for hostile in ("../../etc/shadow", "..", "a/../../b", "x\0y", "/abs"):
+        for path in (xfilter.domain_auth(hostile),
+                     xfilter.domain_pid_file(hostile)):
+            assert path.startswith(root + "/"), path
+            assert "/" not in path[len(root) + 1:], path
+
+
+def test_domain_display_search_is_stable_and_complete():
+    """The display is derived, not remembered, so the order it is looked for
+    in has to be the same every time -- and it has to cover the whole range,
+    since a busy display must cost the next number rather than a failure."""
+    order = xfilter.domain_displays("work@buildbox")
+    assert order == xfilter.domain_displays("work@buildbox"), "not stable"
+    assert sorted(order) == list(range(xfilter.DOMAIN_FIRST,
+                                       xfilter.DOMAIN_LAST + 1)), order
+    other = xfilter.domain_displays("other@buildbox")
+    assert order[0] != other[0], "two domains start on the same display"
+
+
+def test_a_domain_that_is_not_running_says_how_to_start_it():
+    """The using side never starts anything, so its error has to be useful."""
+    try:
+        xfilter.domain_environment("no-such-domain-%d" % os.getpid())
+    except SystemExit as exc:
+        assert "--domain" in str(exc), exc
+    else:
+        raise AssertionError("a missing domain was not an error")
+
 
 def main():
     """Run every test_* function, and report all failures rather than the first.

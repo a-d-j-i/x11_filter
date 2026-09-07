@@ -38,8 +38,10 @@
 # E2E_* spellings still work here.
 #
 # The proxy is generic -- it filters whatever speaks the X protocol -- so any
-# X client works here.  Needs xwininfo, xauth, and Xvfb or Xephyr; skips apps
-# that are absent.
+# X client works here.  Needs python3, xauth, xwininfo, xdotool, xwd, bc,
+# setsid and Xvfb or Xephyr -- each checked up front with what it is for --
+# plus xclip for the clipboard checks, which are skipped without it.  Absent
+# applications are skipped too.
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -89,8 +91,32 @@ cleanup() { teardown; rm -rf "$work"; }
 trap cleanup EXIT
 proxy=""; wm=""; upsrv=""; parent=""; allower=""
 
-need() { command -v "$1" >/dev/null || { echo "SKIP: $1 not installed"; exit 0; }; }
-need xwininfo; need xauth
+# Every tool the run leans on, checked before anything is started and named
+# with what it is for.  A rig that dies half way through because xdotool is
+# missing costs a minute and reports nothing -- and worse, a check that quietly
+# did not run looks from the outside exactly like a check that passed.
+need() {
+    command -v "$1" >/dev/null && return 0
+    echo "SKIP: $1 is not installed -- $2"
+    [ -n "${3:-}" ] && echo "      Debian/Ubuntu: apt install $3"
+    exit 0
+}
+# ...and the ones whose absence costs a check rather than the whole run.  These
+# say what is lost and let the run continue, so what it does report still
+# means what it says.
+optional() {
+    command -v "$1" >/dev/null && return 0
+    echo "note: $1 is not installed -- $2"
+    [ -n "${3:-}" ] && echo "      Debian/Ubuntu: apt install $3"
+    return 1
+}
+need python3  "the proxy under test, and the harness's own helpers, are Python" python3
+need xauth    "the throwaway displays are cookie-protected, and this writes their cookie files" xauth
+need xwininfo "each client's window, and its geometry, is found by asking the server" x11-utils
+need xdotool  "the menu check drives real pointer and keyboard input at the server" xdotool
+need xwd      "the menu check dumps the window's own pixels to prove the menu really drew" x11-apps
+need bc       "window areas are multiplied out, to tell a client's own window from its frame" bc
+need setsid   "each client is started in its own session so it can be killed as a group" util-linux
 
 # -- what to run, on which axes ---------------------------------------------
 case "${RIG_SERVER:-${E2E_SERVER:-xvfb}}" in
@@ -113,8 +139,11 @@ for s in "${servers[@]}"; do
     { [ "$s" = xvfb ] || [ -z "${RIG_PARENT:-${E2E_PARENT:-}}" ]; } && need Xvfb
 done
 for m in "${managers[@]}"; do
-    [ "$m" = none ] || command -v "$m" >/dev/null || {
-        echo "SKIP: $m not installed"; exit 0; }
+    [ "$m" = none ] || need "$m" \
+        "RIG_WM asked for it; a reparenting window manager is what makes the
+      toolkit send the requests this policy substitutes replies for. Set
+      RIG_WM=none to run without one, knowing the run then covers less" \
+        "$([ "$m" = openbox ] && echo openbox || echo metacity)"
 done
 
 cookie() { python3 -c 'import os; print(os.urandom(16).hex())'; }
@@ -196,9 +225,96 @@ changed() { cmp -l "$1" "$2" 2>/dev/null | wc -l; }
 # had ever pasted anything.  The timing itself is pinned by the unit tests, which can do it
 # deterministically; what this adds is the proof that a real toolkit's INCR
 # transfer crosses the proxy intact at all.
+# Trust domains: `--domain` starts one and lives until stopped, `--use` and
+# `--env` attach to it.  Checked here rather than in the unit tests because
+# what is claimed is about processes and sockets -- that a second start finds
+# the first rather than making a second trust domain wear the same name, that
+# the display is derived (nothing was told to the second command), and that
+# --stop actually stops it.
+trust_domains() {
+    local domain="e2e-domain-$$" broke=0 where="" again="" env_display=""
+    # Started the way the shell helpers do it -- the proxy runs in the
+    # foreground and the shell backgrounds it -- so this exercises the
+    # documented path rather than a mode that exists only for tests.
+    DISPLAY="$up" XAUTHORITY="$up_auth" python3 "$here/xfilter.py" \
+        --domain "$domain" --upstream "$up" --upstream-auth "$up_auth" \
+        >"$work/$domain.log" 2>&1 &
+    for _ in $(seq 60); do
+        where="$(python3 "$here/xfilter.py" --env "$domain" 2>/dev/null \
+                 | sed -n 's/^export DISPLAY=//p')"
+        [ -n "$where" ] && break
+        sleep 0.25
+    done
+    if [ -z "$where" ]; then
+        echo "FAIL  --domain did not start a filter"
+        tail -3 "$work/$domain.log"
+        return 1
+    fi
+
+    again="$(python3 "$here/xfilter.py" --domain "$domain" --upstream "$up" \
+        2>&1 | grep -o ':[0-9]\+' | head -1)"
+    if [ "$again" = "$where" ]; then
+        echo "PASS  a second --domain found the first on $where"
+    else
+        echo "FAIL  --domain started a second filter for one name ($where then $again)"
+        broke=1
+    fi
+
+    # The using side: nothing here was told where the domain lives.
+    env_display="$(python3 "$here/xfilter.py" --env "$domain" \
+                   | sed -n 's/^export DISPLAY=//p')"
+    if [ "$env_display" = "$where" ]; then
+        echo "PASS  --env derived the same display from the name alone"
+    else
+        echo "FAIL  --env gave '$env_display', not $where"
+        broke=1
+    fi
+    if python3 "$here/xfilter.py" --use "$domain" -- xwininfo -root \
+            >/dev/null 2>&1; then
+        echo "PASS  --use ran a client on the domain's display"
+    else
+        echo "FAIL  --use could not run a client on the domain's display"
+        broke=1
+    fi
+
+    # The safety property the derived display rests on: a *different* domain
+    # that ends up looking at this display must be refused, not quietly let
+    # in.  Forced here rather than waited for -- give the other domain a
+    # cookie for this display, with the wrong value, which is exactly what a
+    # hash collision would produce -- because two names sharing one filter is
+    # the one outcome that must be impossible.
+    local other="$domain-collides"
+    python3 - "$here" "$other" "${where#:}" <<'PY'
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import xfilter, xfilter_core
+xfilter_core.write_xauth_entry(xfilter.domain_auth(sys.argv[2]),
+                               sys.argv[3], xfilter_core.COOKIE_NAME,
+                               os.urandom(16))
+PY
+    if python3 "$here/xfilter.py" --env "$other" >/dev/null 2>&1; then
+        echo "FAIL  a second domain attached to $where with its own cookie"
+        broke=1
+    else
+        echo "PASS  a colliding domain was refused $where rather than joining it"
+    fi
+    rm -f "$(python3 -c "import sys; sys.path.insert(0, '$here'); import xfilter; print(xfilter.domain_auth('$other'))")"
+
+    python3 "$here/xfilter.py" --stop "$domain" >/dev/null 2>&1
+    if python3 "$here/xfilter.py" --env "$domain" >/dev/null 2>&1; then
+        echo "FAIL  --stop left the filter running"
+        broke=1
+    else
+        echo "PASS  --stop stopped it, and --env says so"
+    fi
+    return "$broke"
+}
+
 clipboard_out() {
-    command -v xclip >/dev/null || {
-        echo "skip  clipboard paste-out (xclip not installed)"; return 0; }
+    optional xclip \
+        "the clipboard checks need a client that can hold a selection and read
+      one back; without it nothing here exercises the gate or the INCR path" \
+        xclip || { echo "skip  clipboard paste-out (no xclip)"; return 0; }
     kill -0 "${allower:-0}" 2>/dev/null || {
         echo "skip  clipboard paste-out (no --gate allow proxy)"; return 0; }
     local payload="$work/clip.in" got="$work/clip.out" owner="" size="" broke=0
@@ -430,6 +546,7 @@ run_combination() {
     done
 
     clipboard_out || broken=$((broken + 1))
+    trust_domains || broken=$((broken + 1))
 
     echo "operations the policy blocked:"
     if grep -qF ' blocked ' "$work/ops.log" 2>/dev/null; then

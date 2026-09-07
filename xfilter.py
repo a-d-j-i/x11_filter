@@ -62,8 +62,11 @@ sees a refusal for the selection it actually asked about.
 
 import argparse
 import collections
+import hashlib
 import os
 import queue
+import re
+import shlex
 import signal
 import struct
 import subprocess
@@ -72,12 +75,24 @@ import tempfile
 import threading
 import time
 
-from xfilter_core import (Connection, CORE_NAMES, Profile, connect_upstream,
-                         cookie_for, listen, pad4, parse_display, printable,
-                         read_exactly, upstream_candidates, working_cookie)
+# xfilter_core lives beside this file, and this file is often reached through a
+# symlink on $PATH.  Python resolves the script's symlink before setting
+# sys.path[0] only from 3.11 on, so on an older interpreter the import would
+# look in the symlink's directory and fail; resolving it here works everywhere.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from xfilter_core import (Connection, CORE_NAMES, Profile,
+                          accepted_by_upstream, connect_upstream, cookie_for,
+                          listen, pad4, parse_display, printable,
+                          read_exactly, read_xauth, upstream_candidates,
+                          working_cookie)
 
 # Reverse of CORE_NAMES, so allowlists below can be written as request names
 # rather than a wall of opcode numbers.
+#: Bumped when behaviour a user could depend on changes.  A package needs a
+#: version, and so does the first line of a bug report.
+__version__ = "0.9"
+
 _OPCODE = {name: opcode for opcode, name in CORE_NAMES.items()}
 
 
@@ -1176,15 +1191,350 @@ def spawn(command, display, xauth, finish):
     return child
 
 
-def fetch_selection(display, xauth, selection):
-    """What is actually in the selection right now, for the prompt."""
-    env = dict(os.environ, DISPLAY=display, XAUTHORITY=xauth)
+#: How long the prompt waits for the selection's owner to hand over the
+#: preview.  The owner is another application and need never answer, so this
+#: is a bound on somebody else's behaviour: a prompt that appears with no
+#: preview is a nuisance, a prompt that never appears is a hang.
+PREVIEW_TIMEOUT = 3
+
+
+# --- trust domains: starting a proxy, and using one -------------------------
+#
+# These are two different jobs and the code keeps them apart, because
+# conflating them is what makes this kind of thing complicated.
+#
+#   *Starting* happens once per trust domain and decides everything that
+#   matters -- which display, which cookie, which upstream, which gate.  It is
+#   an ordinary foreground run of this program under a name, so a terminal, a
+#   login script or a systemd user unit can own it, and it lives until it is
+#   stopped.  Backgrounding it is not this program's business: `&` is a thing
+#   shells already do, and xfilter.bash does it there where it can be read.
+#
+#   *Using* happens constantly, from every shell and script, and decides
+#   nothing: it looks up the display and cookie a name resolves to and puts
+#   them in front of one command.
+#
+# The display is not recorded anywhere: it is *derived* from the name (a hash
+# picks where to start looking) and confirmed by asking the server there
+# whether it takes this domain's cookie.  That test is what makes a collision
+# safe -- two names that start looking in the same place do not merge into one
+# proxy, because the second one is refused and moves on.  Sharing a proxy is
+# sharing everything behind it, so a silent merge is the one outcome that must
+# be impossible.
+
+#: The display numbers a derived domain may live on.
+DOMAIN_FIRST, DOMAIN_LAST = 20, 79
+
+
+def domain_root():
+    """Where a user's domain files live: cookie and pid, one pair per domain.
+
+    $XDG_RUNTIME_DIR when there is one -- per-user, on tmpfs, cleared at
+    logout, which is the right lifetime for a display that dies with the
+    session -- and the temp directory otherwise.
+    """
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    root = os.path.join(base, "xfilter-%d" % os.getuid())
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    return root
+
+
+def domain_key(name):
+    """A filename for a domain, that two domains cannot share.
+
+    Anything awkward is replaced, and a hash of the original is appended when
+    that replacement lost information: `me@host` and `me/host` must not become
+    one set of files, because one set of files would mean one proxy.
+    """
+    safe = re.sub(r"[^A-Za-z0-9._@-]", "_", name)
+    if safe != name or len(safe) > 64:
+        safe = "%s-%s" % (safe[:64],
+                          hashlib.sha1(name.encode()).hexdigest()[:8])
+    return safe
+
+
+def domain_auth(name):
+    return os.path.join(domain_root(), domain_key(name) + ".auth")
+
+
+def domain_pid_file(name):
+    return os.path.join(domain_root(), domain_key(name) + ".pid")
+
+
+def domain_displays(name):
+    """Display numbers to try for a domain, best first.
+
+    A hash spreads domains over the range so two of them usually do not
+    contend, and the walk from there means a busy display simply costs the
+    next number rather than a failure.
+    """
+    span = DOMAIN_LAST - DOMAIN_FIRST + 1
+    first = int(hashlib.sha1(name.encode()).hexdigest()[:8], 16) % span
+    return [DOMAIN_FIRST + (first + step) % span for step in range(span)]
+
+
+def domain_socket(number):
+    return "/tmp/.X11-unix/X%d" % number
+
+
+def domain_running(name):
+    """The display this domain's proxy is on, or None if it is not up.
+
+    Only the numbers this domain has a cookie for are worth asking about, and
+    each one is settled by a real handshake: a socket file left behind by a
+    dead proxy refuses the connection, and a *live* proxy belonging to some
+    other domain refuses the cookie.  Nothing here trusts a file's word for
+    it.
+    """
+    auth = domain_auth(name)
+    numbers = sorted({int(entry[2]) for entry in read_xauth(auth)
+                      if entry[2].isdigit()})
+    for number in numbers:
+        display = ":%d" % number
+        if not os.path.exists(domain_socket(number)):
+            continue
+        try:
+            cookie = cookie_for(auth, display)
+        except SystemExit:
+            continue
+        try:
+            if accepted_by_upstream(parse_display(display), cookie):
+                return display
+        except (OSError, SystemExit):
+            # Anything that is not a clean "yes" means not running, and the
+            # noisy case is a proxy shutting down while we ask: it accepts the
+            # connection and then dies, which arrives here as a reset rather
+            # than as a refusal.  --stop polls this in a loop, so it is the
+            # normal way a stopping proxy is seen to have stopped.
+            continue
+    return None
+
+
+def domain_free_display(name):
+    """The first display number nothing is using, in this domain's order."""
+    for number in domain_displays(name):
+        if not os.path.exists(domain_socket(number)):
+            return ":%d" % number
+    raise SystemExit("no free display between :%d and :%d"
+                     % (DOMAIN_FIRST, DOMAIN_LAST))
+
+
+def domain_environment(name):
+    """DISPLAY and XAUTHORITY for a running domain, or a message saying how
+    to start it.  Every use of a domain comes through here."""
+    display = domain_running(name)
+    if not display:
+        raise SystemExit(
+            "no filter is running for %s.\n"
+            "Start one with:  xfilter.py --domain %s --gate ask" % (name, name))
+    return {"DISPLAY": display, "XAUTHORITY": domain_auth(name)}
+
+
+def use_domain(name, command):
+    """--use: run one command against a domain's display.
+
+    Scoped to the command on purpose.  Exporting a domain into a *shell*
+    leaves it there after you have forgotten, and the next thing you start in
+    that shell silently joins a trust domain it has nothing to do with.
+    """
+    env = dict(os.environ, **domain_environment(name))
     try:
-        done = subprocess.run(["xclip", "-o", "-selection", selection],
-                              env=env, capture_output=True, timeout=3)
-        return done.stdout.decode("utf-8", "replace")
-    except (subprocess.SubprocessError, OSError):
-        return ""
+        child = subprocess.Popen(command, env=env)
+    except OSError as exc:
+        raise SystemExit("cannot run %s: %s" % (command[0], exc))
+    try:
+        raise SystemExit(child.wait())
+    except KeyboardInterrupt:
+        child.terminate()
+        raise SystemExit(child.wait())
+
+
+def print_domain_environment(name):
+    """--env: the same thing, for `eval` in a script.
+
+    stdout is the machine's and stderr is the person's, so this prints the two
+    lines and nothing else.  The scope rule from use_domain applies to whoever
+    evals it: everything after it belongs to that domain.
+    """
+    for key, value in sorted(domain_environment(name).items()):
+        print("export %s=%s" % (key, shlex.quote(value)))
+
+
+#: How often the proxy checks that the display it forwards to is still there,
+#: and how many misses in a row it takes to believe it.  A poll rather than a
+#: watch on the anchor connection, because focus_window reads that socket and
+#: a second reader would eat its replies.
+UPSTREAM_POLL, UPSTREAM_MISSES = 5, 3
+
+
+def watch_upstream(target, display, finish):
+    """Stop when the display we forward to goes away.
+
+    Two reasons, and the second is the one that matters.
+
+    A proxy whose upstream is gone serves nothing -- every client it accepts
+    fails at the handshake -- so it is a display number and a pid pretending
+    to be a service.  With `--domain` it is long-lived, so without this an X
+    session ending would leave one behind on every logout, and the next login
+    would start another beside it.
+
+    And the server's *vocabulary* is what the policy is written against: atom
+    ids and extension opcodes are learned once, from that server, and are
+    stable only for its life.  If a new server comes up on the same display,
+    every rule keyed on those numbers would be judging a stranger's ids --
+    the thirteenth pass's finding, arriving by a different road.  Exiting, and
+    being started again against the new server, is the only honest answer.
+    """
+    misses = 0
+    while True:
+        time.sleep(UPSTREAM_POLL)
+        try:
+            connect_upstream(target).close()
+            misses = 0
+        except OSError:
+            misses += 1
+            if misses >= UPSTREAM_MISSES:
+                print("the upstream display %s is gone; exiting" % display,
+                      file=sys.stderr)
+                finish()
+                return
+
+
+def list_domains():
+    """What is running, for the user who has forgotten what they started."""
+    root = domain_root()
+    rows = []
+    for entry in sorted(os.listdir(root)):
+        if not entry.endswith(".pid"):
+            continue
+        path = os.path.join(root, entry)
+        try:
+            with open(path) as handle:
+                pid = int(handle.readline().strip())
+                name = handle.readline().strip() or entry[:-4]
+        except (OSError, ValueError):
+            continue
+        display = domain_running(name)
+        rows.append((name, display or "-", pid,
+                     "yes" if display else "no"))
+    if not rows:
+        print("no filtered domains are running")
+        return
+    print("%-30s %-9s %-8s %s" % ("domain", "display", "pid", "serving"))
+    for row in rows:
+        print("%-30s %-9s %-8d %s" % row)
+
+
+def stop_domain(name):
+    pid_file = domain_pid_file(name)
+    try:
+        with open(pid_file) as handle:
+            pid = int(handle.readline().strip())
+    except (OSError, ValueError):
+        raise SystemExit("no filter is recorded for %s" % name)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        print("it was not running (%s); cleaning up" % exc, file=sys.stderr)
+    for _ in range(40):
+        if not domain_running(name):
+            break
+        time.sleep(0.25)
+    for path in (pid_file, domain_auth(name)):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    print("stopped the filter for %s" % name)
+
+
+def fetch_selection(selection, timeout=PREVIEW_TIMEOUT):
+    """What is actually in the selection right now, for the prompt.
+
+    Read over the GTK connection the prompt is already using rather than by
+    running xclip.  --gate ask needs GTK regardless, and that connection is
+    to the real display, which is where the selection lives and deliberately
+    not through our own filtered one.  Shelling out made the preview depend
+    on a package nobody was told to install, and when it was missing the
+    dialog said the owner had offered nothing readable -- a different fact,
+    and the wrong one to show somebody deciding whether to allow a paste.
+
+    Anything that is not text comes back empty, which is the same answer the
+    old path gave and is honest: an image is not something this dialog can
+    show, and the caller says so.
+    """
+    from gi.repository import Gtk, Gdk, GLib
+
+    clipboard = Gtk.Clipboard.get(Gdk.Atom.intern(selection, False))
+    loop, box = GLib.MainLoop(), {"text": "", "done": False, "timer": None}
+
+    def finished():
+        box["done"] = True
+        if loop.is_running():
+            loop.quit()
+
+    def arrived(_clipboard, text):
+        box["text"] = text or ""
+        finished()
+
+    def expired():
+        box["timer"] = None       # already gone: do not remove it twice
+        finished()
+        return False
+
+    # The callback can fire before the loop starts -- when we own the
+    # selection ourselves the answer is immediate -- and quitting a loop that
+    # has not run leaves it running forever, so the flag is what decides.
+    clipboard.request_text(arrived)
+    if not box["done"]:
+        box["timer"] = GLib.timeout_add(int(timeout * 1000), expired)
+        loop.run()
+    if box["timer"] is not None:
+        GLib.source_remove(box["timer"])
+    return box["text"]
+
+
+def bring_to_front(dialog, first=False):
+    """Put the prompt where the user will actually see it.
+
+    Three different things can bury it, so three different things are asked:
+
+      * **A window manager's focus-stealing prevention.**  A map from an
+        application the user has not just interacted with is deliberately not
+        given the focus -- the window is marked "wants attention" and left
+        where it is.  The answer is a real X server timestamp: with one,
+        present_with_time is a request the window manager will honour.
+      * **A window manager's stacking.**  keep-above, sticky and the urgency
+        hint are set once on the dialog; they are properties, not actions.
+      * **No window manager at all**, which is the case inside a bare Xephyr
+        -- the shape this project's own live rig has.  Then every hint above
+        means nothing, because nothing is reading them, and the only thing
+        that raises a window is XRaiseWindow.  So the prompt raises itself,
+        and keeps doing it on each countdown tick: a client that maps a
+        window afterwards must not be able to bury the decision it is the
+        subject of.
+
+    The timestamp is fetched only on the first call.  It is a round trip to
+    the server (a zero-length property append, then its PropertyNotify), and
+    the tick that follows only needs to restack.
+    """
+    window = dialog.get_window()
+    if window is None:                       # not realised yet: nothing to do
+        return
+    window.raise_()
+    if not first:
+        return
+    try:
+        import gi
+        gi.require_version("GdkX11", "3.0")
+        from gi.repository import GdkX11
+        stamp = GdkX11.x11_get_server_time(window)
+    except Exception:                        # not X11, or no GdkX11 typelib
+        stamp = 0
+    if stamp:
+        dialog.present_with_time(stamp)
+    else:
+        dialog.present()
 
 
 class Gate:
@@ -1208,9 +1558,7 @@ class Gate:
     #: without asking: a queue of dialogs is not a decision, it is a flood.
     MAX_PENDING = 2
 
-    def __init__(self, display, xauth, timeout, remember):
-        self.display = display
-        self.xauth = xauth
+    def __init__(self, timeout, remember):
         self.timeout = timeout
         self.remember = remember
         self.requests = queue.Queue()
@@ -1280,7 +1628,7 @@ class Gate:
         return True
 
     def ask(self, identity, selection, target, peer, action, answer, answered):
-        from gi.repository import Gtk, GLib
+        from gi.repository import Gdk, Gtk, GLib
 
         owning = action == "own"
         fullscreen = action == "fullscreen"
@@ -1291,17 +1639,24 @@ class Gate:
                  else "Clipboard request")
         dialog = Gtk.Dialog(title=title, modal=False)
         dialog.set_keep_above(True)
+        # Shown on every virtual desktop: the prompt denies on a countdown, so
+        # one that opened on the desktop the user has just left is a decision
+        # taken by default rather than by them.
+        dialog.stick()
+        dialog.set_urgency_hint(True)
         dialog.add_button("Deny", 0)
         dialog.add_button("Allow once", 1)
         dialog.add_button("Allow for a while", 2)
 
+        # x11_get_server_time works by appending to a property and waiting
+        # for the notification, so the window has to be listening for one.
+        dialog.add_events(Gdk.EventMask.PROPERTY_CHANGE_MASK)
         box = dialog.get_content_area()
         box.set_spacing(8)
         box.set_border_width(12)
         # The clipboard prompts show the selection's current contents; the
         # fullscreen prompt has nothing to fetch.
-        value = "" if fullscreen or keyboard else fetch_selection(
-            self.display, self.xauth, selection)
+        value = "" if fullscreen or keyboard else fetch_selection(selection)
         heading = Gtk.Label(xalign=0)
         # The bold name is the client's own claim about itself and can say
         # anything; the peer line underneath is what the socket reports and
@@ -1358,9 +1713,11 @@ class Gate:
                 dialog.response(0)
                 return False
             countdown.set_text("denied automatically in %ds" % left)
+            bring_to_front(dialog)
             return True
         tick()
         GLib.timeout_add(500, tick)
+        bring_to_front(dialog, first=True)
 
         choice = dialog.run()
         dialog.destroy()
@@ -4177,9 +4534,17 @@ def main():
                              "after -- is the remote command")
     parser.add_argument("command", nargs=argparse.REMAINDER,
                         help="command to run through the proxy, after --")
-    parser.add_argument("--upstream", default=os.environ.get("DISPLAY", ":0"))
-    parser.add_argument("--auth", metavar="XAUTHORITY")
-    parser.add_argument("--upstream-auth", metavar="XAUTHORITY")
+    parser.add_argument("--upstream", default=os.environ.get("DISPLAY", ":0"),
+                        help="the real display to forward to (default: $DISPLAY"
+                             "); the prompt opens here too")
+    parser.add_argument("--auth", metavar="FILE",
+                        help="authority file (xauth format) for the cookie "
+                             "clients must present to --display; created if "
+                             "missing (default: a private temp file, removed "
+                             "on exit)")
+    parser.add_argument("--upstream-auth", metavar="FILE",
+                        help="authority file holding the cookie for --upstream "
+                             "(default: $XAUTHORITY, then ~/.Xauthority)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="report every connection and its outcome")
     parser.add_argument("--dry-run", action="store_true",
@@ -4202,19 +4567,68 @@ def main():
                         help="deny a pending prompt after this long (20)")
     parser.add_argument("--gate-remember", type=int, default=300, metavar="S",
                         help="how long 'Allow for a while' lasts (300)")
+    parser.add_argument("--domain", metavar="NAME",
+                        help="run as the filter for this trust domain: the "
+                             "display and the cookie are derived from the "
+                             "name, so nothing has to be remembered or passed "
+                             "around. Runs in the foreground and lives until "
+                             "it is stopped; if one is already running for "
+                             "this name it says so and exits. Everything "
+                             "behind one filter can read everything else "
+                             "behind it, so the name is the security "
+                             "boundary: one per account, or per application "
+                             "you do not trust")
+    parser.add_argument("--use", metavar="NAME",
+                        help="run the command after -- against this domain's "
+                             "filtered display; the environment is scoped to "
+                             "that command and nothing else")
+    parser.add_argument("--env", metavar="NAME",
+                        help="print this domain's two export lines on stdout, "
+                             "for eval in a shell script (everything else "
+                             "goes to stderr, so the output is safe to eval)")
+    parser.add_argument("--list", action="store_true",
+                        help="list the filtered domains running for you")
+    parser.add_argument("--stop", metavar="NAME",
+                        help="stop the filter for a domain")
+    parser.add_argument("--version", action="version",
+                        version="xfilter %s" % __version__)
     parser.add_argument("--log", metavar="FILE",
                         help="also append the operation log (each new "
                              "operation, and the exit report) to FILE; it "
                              "always goes to stdout as well")
     args = parser.parse_args()
     args.enforce = not args.dry_run
-    if args.gate == "ask":
-        check_gtk()
+    # The using side first: none of it starts a proxy, and none of it needs
+    # the rest of the setup below.
+    if args.list:
+        return list_domains()
+    if args.stop:
+        return stop_domain(args.stop)
+    if args.env:
+        return print_domain_environment(args.env)
     if args.command and args.command[0] == "--":
         args.command = args.command[1:]
     if args.ssh:
         args.command = ["ssh", "-X", "-o", "ForwardX11Trusted=yes",
                         args.ssh] + args.command
+    if args.use:
+        if not args.command:
+            raise SystemExit("--use %s needs a command: ... -- ssh -X %s"
+                             % (args.use, args.use))
+        return use_domain(args.use, args.command)
+
+    if args.gate == "ask":
+        check_gtk()
+    if args.domain:
+        # The starting side.  Idempotent on purpose: a login script or a unit
+        # may run it every time, and the second run must be a no-op rather
+        # than a second trust domain wearing the same name.
+        running = domain_running(args.domain)
+        if running:
+            print("%s is already filtered on %s" % (args.domain, running))
+            return
+        args.display = args.display or domain_free_display(args.domain)
+        args.auth = args.auth or domain_auth(args.domain)
     if args.display is None:
         args.display = free_display()
     minted_auth = not args.auth
@@ -4260,6 +4674,13 @@ def main():
     for opcode, name in extension_opcodes.items():
         profile.note_extension(opcode, name, extension_events.get(name))
     server, unix_path = listen(args.display)
+    if args.domain:
+        # Written only now: before listen() succeeded there was nothing to
+        # point anybody at.  --list and --stop are its only readers; whether
+        # the domain is *serving* is still settled by a handshake, never by
+        # this file.
+        with open(domain_pid_file(args.domain), "w") as handle:
+            handle.write("%d\n%s\n" % (os.getpid(), args.domain))
 
     PolicyConnection.gate_mode = args.gate
     PolicyConnection.extension_opcodes = extension_opcodes
@@ -4270,14 +4691,15 @@ def main():
         except OSError as exc:
             raise SystemExit("cannot open --log %s: %s" % (args.log, exc))
     if args.gate == "ask":
-        PolicyConnection.gate = Gate(args.upstream, upstream_auth,
-                                     args.gate_timeout, args.gate_remember)
+        PolicyConnection.gate = Gate(args.gate_timeout, args.gate_remember)
 
     def finish(signum=None, frame=None):
         profile.dump(enforcing=args.enforce)
         if profile.log_file is not None:
             profile.dump(stream=profile.log_file, enforcing=args.enforce)
-        for path in (unix_path, args.auth if minted_auth else None):
+        for path in (unix_path,
+                     args.auth if minted_auth else None,
+                     domain_pid_file(args.domain) if args.domain else None):
             if path:
                 try:
                     os.unlink(path)
@@ -4339,6 +4761,10 @@ def main():
     # is slow to answer cannot hold up accepting clients.
     accepting = threading.Thread(target=serve, name="accept", daemon=True)
     accepting.start()
+
+    threading.Thread(target=watch_upstream, name="upstream", daemon=True,
+                     args=(upstream_target, args.upstream, finish)).start()
+
 
     if args.gate == "ask":
         # The prompt must talk to the real display directly: routing it
