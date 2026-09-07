@@ -26,8 +26,8 @@ jobs:
       # Both pinned.  An unpinned linter turns somebody else's release into a
       # red build on a tree nobody touched -- and the runner image's shellcheck
       # did exactly that: 0.10 reports an unused trap handler as SC2317 where
-      # 0.11 reports it as SC2329, so a directive naming one code passed here
-      # and failed there.  Bump these deliberately.
+      # 0.11 reports it as SC2329, so a directive naming one code passed
+      # locally and failed here.  Bump these deliberately.
       - name: Install the linters
         run: |
           pipx install ruff==0.16.6
@@ -37,34 +37,47 @@ jobs:
       - name: Shell
         run: shellcheck -s bash *.sh xfilter.bash
 
+  # In a Debian container, not on the Ubuntu runner.  This is a Debian
+  # package: Ubuntu's lintian rejects "unstable" as a distribution and carries
+  # an older Policy list, so it fails a package that is correct and passes one
+  # that is not.  Checking it anywhere else is checking the wrong thing.
   package:
     runs-on: ubuntu-latest
+    container: debian:trixie
     steps:
+      # Before checkout, so the action clones rather than unpacking a tarball
+      # -- package.sh takes the tarball's timestamps from the commit date.
+      - name: git
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends git ca-certificates
       - uses: actions/checkout@v4
+      # The workspace is owned by the runner user and the container runs as
+      # root, which git calls dubious ownership and refuses to read.  Without
+      # this, package.sh cannot ask for the commit date and quietly stamps the
+      # tarball with the epoch instead.
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Build dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-              build-essential debhelper dpkg-dev fakeroot lintian man-db
+          apt-get install -y -qq --no-install-recommends \
+              build-essential debhelper dpkg-dev fakeroot lintian man-db python3
       # package.sh runs test_unit.py as the package's own build-time test, so
       # a policy regression fails the build here as well.
       - name: Build the package
         run: ./package.sh
       - name: Lintian
         run: |
-          # Errors fail the build; warnings are printed and do not.  The
-          # runner is Ubuntu and its lintian carries tags Debian's does not,
-          # so gating on warnings gates on somebody else's tag set.  Raise
-          # this to error,warning if the package is ever actually proposed.
-          #
           # initial-upload-closes-no-bugs is suppressed on purpose: it asks for
-          # the ITP bug number, which does not exist until then.
-          lintian --fail-on error \
+          # the ITP bug number, which does not exist until the package is
+          # actually proposed to Debian.  Delete this line the day the
+          # changelog says "Initial release (Closes: #NNNNNN)".
+          lintian --fail-on error,warning \
               --suppress-tags initial-upload-closes-no-bugs \
               build/xfilter_*.changes
       - name: Install it, and check what landed
         run: |
-          sudo apt-get install -y ./build/xfilter_*_all.deb
+          apt-get install -y ./build/xfilter_*_all.deb
           xfilter --version
           xfilter.py --version          # the compatibility link
           test -f /usr/share/xfilter/xfilter_core.py
