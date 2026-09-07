@@ -15,14 +15,14 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Unit tests
         run: python3 test_unit.py
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Both pinned.  An unpinned linter turns somebody else's release into a
       # red build on a tree nobody touched -- and the runner image's shellcheck
       # did exactly that: 0.10 reports an unused trap handler as SC2317 where
@@ -51,7 +51,7 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends git ca-certificates
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The workspace is owned by the runner user and the container runs as
       # root, which git calls dubious ownership and refuses to read.  Without
       # this, package.sh cannot ask for the commit date and quietly stamps the
@@ -82,7 +82,7 @@ jobs:
           xfilter.py --version          # the compatibility link
           test -f /usr/share/xfilter/xfilter_core.py
           man --warnings -E UTF-8 -l /usr/share/man/man1/xfilter.1.gz >/dev/null
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: xfilter-deb
           path: build/xfilter_*

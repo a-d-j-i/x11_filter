@@ -38,7 +38,7 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends git ca-certificates
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The workspace is owned by the runner user and the container runs as
       # root, which git calls dubious ownership and refuses to read.  Without
       # this, package.sh cannot ask for the commit date and quietly stamps the
@@ -76,7 +76,7 @@ jobs:
       - name: Checksums
         run: cd build && sha256sum xfilter_* > SHA256SUMS && cat SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: release-files
           path: |
@@ -89,7 +89,7 @@ jobs:
     permissions:
       contents: write        # to create the release
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: release-files
           path: release
